@@ -1,0 +1,3 @@
+client_id,requisition_id,job_title,role_family,location,experience_level,opened_at,status,source_system_id,source_record_id,mapping_version,ingest_run_id
+demo_client,REQ-101,Data Analyst,Analytics,Chennai,Mid,2026-01-05T09:00:00+05:30,closed,demo_csv,REQ-101,1.0,demo-run-001
+demo_client,REQ-102,Backend Engineer,Engineering,Remote,Senior,2026-02-01T09:00:00+05:30,open,demo_csv,REQ-102,1.0,demo-run-001

@@ -1,0 +1,46 @@
+{
+  "passed": 8,
+  "total": 8,
+  "tests": [
+    {
+      "name": "health endpoint",
+      "passed": true,
+      "detail": 200
+    },
+    {
+      "name": "missing token rejected",
+      "passed": true,
+      "detail": 401
+    },
+    {
+      "name": "invalid token rejected",
+      "passed": true,
+      "detail": 401
+    },
+    {
+      "name": "authorized analytics returns aggregate JSON",
+      "passed": true,
+      "detail": 200
+    },
+    {
+      "name": "invalid policy rejected",
+      "passed": true,
+      "detail": 400
+    },
+    {
+      "name": "unknown query parameter rejected",
+      "passed": true,
+      "detail": 400
+    },
+    {
+      "name": "unknown requisition gives 404",
+      "passed": true,
+      "detail": 404
+    },
+    {
+      "name": "write method rejected",
+      "passed": true,
+      "detail": 405
+    }
+  ]
+}

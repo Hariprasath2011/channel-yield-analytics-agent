@@ -1,0 +1,6 @@
+.env
+*.sqlite
+*.db
+__pycache__/
+*.py[cod]
+ingestion_run_output.json

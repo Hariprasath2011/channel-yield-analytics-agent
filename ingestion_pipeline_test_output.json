@@ -1,0 +1,68 @@
+{
+  "passed": 5,
+  "total": 5,
+  "tests": [
+    {
+      "test": "first import inserts fixture rows",
+      "passed": true,
+      "actual": {
+        "files_processed": 4,
+        "rows_read": 14,
+        "inserted": 14,
+        "updated": 0,
+        "unchanged_replays": 0,
+        "conflicts": 0,
+        "quarantined": 0
+      }
+    },
+    {
+      "test": "second import is idempotent",
+      "passed": true,
+      "actual": {
+        "files_processed": 4,
+        "rows_read": 14,
+        "inserted": 0,
+        "updated": 0,
+        "unchanged_replays": 14,
+        "conflicts": 0,
+        "quarantined": 0
+      }
+    },
+    {
+      "test": "unknown source is warned, not quarantined",
+      "passed": true,
+      "actual": [
+        {
+          "entity": "applications",
+          "source_record_id": "APP-003",
+          "warning": "unknown_source_channel"
+        }
+      ]
+    },
+    {
+      "test": "base semantic validation has no errors",
+      "passed": true,
+      "actual": {
+        "passed": true,
+        "errors": [],
+        "warnings": [
+          "unknown_source_channel:APP-003"
+        ]
+      }
+    },
+    {
+      "test": "client-specific source columns map to canonical fields",
+      "passed": true,
+      "actual": {
+        "client_id": "client_x",
+        "ingest_run_id": "ingest-20261011T095944499063",
+        "job_title": "QA Engineer",
+        "mapping_version": "2.1",
+        "requisition_id": "R-1",
+        "source_record_id": "SRC-1",
+        "source_system_id": "ats_x",
+        "status": "open"
+      }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: channel-yield-analytics-demo
+    runtime: python
+    plan: free
+    buildCommand: "python -m py_compile analytics_api.py analytics_service.py csv_ingestion_pipeline.py semantic_validator.py"
+    startCommand: "python csv_ingestion_pipeline.py --config ingestion_config_demo.json --db demo_ingestion.sqlite && python analytics_api.py --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: CY_API_HOST
+        value: 0.0.0.0
+      - key: CY_CLIENT_ID
+        value: demo_client
+      - key: CY_DB_PATH
+        value: demo_ingestion.sqlite
+      - key: CY_API_TOKEN
+        sync: false

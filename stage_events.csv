@@ -1,0 +1,6 @@
+client_id,stage_event_id,application_id,stage,entered_at,exited_at,source_system_id,source_record_id,mapping_version,ingest_run_id
+demo_client,EV-001,APP-001,applied,2026-01-10T10:00:00+05:30,2026-01-10T10:30:00+05:30,demo_csv,EV-001,1.0,demo-run-001
+demo_client,EV-002,APP-001,screened,2026-01-10T10:30:00+05:30,2026-01-20T10:00:00+05:30,demo_csv,EV-002,1.0,demo-run-001
+demo_client,EV-003,APP-001,interviewed,2026-01-20T10:00:00+05:30,2026-02-10T10:00:00+05:30,demo_csv,EV-003,1.0,demo-run-001
+demo_client,EV-004,APP-001,offered,2026-02-10T10:00:00+05:30,2026-02-20T10:00:00+05:30,demo_csv,EV-004,1.0,demo-run-001
+demo_client,EV-005,APP-001,joined,2026-03-01T09:00:00+05:30,,demo_csv,EV-005,1.0,demo-run-001

@@ -1,0 +1,83 @@
+{
+  "base_fixture": {
+    "status": "PASS",
+    "errors": [],
+    "warnings": [
+      "unknown_source_channel:APP-003"
+    ]
+  },
+  "tests": [
+    {
+      "test": "requisitions: initial import inserts all",
+      "result": "PASS",
+      "detail": "{'inserted': 2, 'unchanged_replays': 0, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "requisitions: identical re-import is idempotent",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 2, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "requisitions: changed source record updates existing",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 0, 'updated': 1, 'conflicts': 0}"
+    },
+    {
+      "test": "applications: initial import inserts all",
+      "result": "PASS",
+      "detail": "{'inserted': 5, 'unchanged_replays': 0, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "applications: identical re-import is idempotent",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 5, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "applications: changed source record updates existing",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 0, 'updated': 1, 'conflicts': 0}"
+    },
+    {
+      "test": "stage_events: initial import inserts all",
+      "result": "PASS",
+      "detail": "{'inserted': 5, 'unchanged_replays': 0, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "stage_events: identical re-import is idempotent",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 5, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "stage_events: changed source record updates existing",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 0, 'updated': 1, 'conflicts': 0}"
+    },
+    {
+      "test": "costs: initial import inserts all",
+      "result": "PASS",
+      "detail": "{'inserted': 2, 'unchanged_replays': 0, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "costs: identical re-import is idempotent",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 2, 'updated': 0, 'conflicts': 0}"
+    },
+    {
+      "test": "costs: changed source record updates existing",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 0, 'updated': 1, 'conflicts': 0}"
+    },
+    {
+      "test": "conflicting canonical ID from different source key is flagged",
+      "result": "PASS",
+      "detail": "{'inserted': 0, 'unchanged_replays': 0, 'updated': 0, 'conflicts': 1}"
+    },
+    {
+      "test": "base fixture passes semantic validation",
+      "result": "PASS",
+      "detail": "errors=[]; warnings=['unknown_source_channel:APP-003']"
+    }
+  ],
+  "passed": 14,
+  "total": 14
+}

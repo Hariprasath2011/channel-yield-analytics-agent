@@ -1,0 +1,59 @@
+openapi: 3.0.3
+info:
+  title: Channel Yield Analytics API
+  version: 1.0.0
+  description: Read-only prototype API. Tenant scope is configured on the server, not supplied by the caller.
+servers:
+  - url: https://YOUR-DEPLOYED-HOST
+paths:
+  /health:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: API process is running
+  /v1/analytics:
+    get:
+      summary: Get recruitment channel analytics
+      description: Returns deterministic analytics for the server-configured client. Dates are application-cohort dates.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: cohort_start
+          schema: {type: string, format: date, default: '2026-01-01'}
+          required: false
+        - in: query
+          name: cohort_end
+          schema: {type: string, format: date, default: '2026-06-30'}
+          required: false
+        - in: query
+          name: as_of_date
+          schema: {type: string, format: date}
+          required: false
+        - in: query
+          name: observation_days
+          schema: {type: integer, minimum: 0, default: 90}
+          required: false
+        - in: query
+          name: requisition_id
+          schema: {type: string}
+          required: false
+        - in: query
+          name: min_sample_size
+          description: Only supply after the client approves the ranking threshold.
+          schema: {type: integer, minimum: 1}
+          required: false
+      responses:
+        '200': {description: Analytics response, schema: {type: object}}
+        '400': {description: Invalid parameters}
+        '401': {description: Missing or invalid bearer token}
+        '404': {description: Requisition not found within configured client}
+        '500': {description: Internal error}
+        '503': {description: Server configuration missing}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

@@ -1,0 +1,403 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/channel-yield-canonical-records-v1.json",
+  "title": "Channel Yield Analytics Canonical Records v1",
+  "description": "Proposed source-agnostic schema. Synthetic/demo only; semantic cross-record checks are separate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "client_id",
+    "requisitions",
+    "applications",
+    "stage_events",
+    "costs",
+    "ingest_run_id",
+    "source_system_id",
+    "mapping_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "client_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "requisitions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/requisition"
+      }
+    },
+    "applications": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/application"
+      }
+    },
+    "stage_events": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stage_event"
+      }
+    },
+    "costs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/cost"
+      }
+    },
+    "ingest_run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_system_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mapping_version": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "date": {
+      "type": "string",
+      "format": "date"
+    },
+    "requisition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_id",
+        "requisition_id",
+        "job_title",
+        "status",
+        "source_system_id",
+        "source_record_id",
+        "mapping_version",
+        "ingest_run_id"
+      ],
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requisition_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "job_title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role_family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "location": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "experience_level": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "opened_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "enum": [
+            "open",
+            "on_hold",
+            "closed",
+            "cancelled",
+            "unknown"
+          ]
+        },
+        "source_system_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_record_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mapping_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ingest_run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "application": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_id",
+        "application_id",
+        "requisition_id",
+        "source_channel",
+        "applied_at",
+        "application_outcome",
+        "source_attribution_method",
+        "source_system_id",
+        "source_record_id",
+        "mapping_version",
+        "ingest_run_id"
+      ],
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "application_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requisition_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_channel": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Use unknown when source is not reliably known."
+        },
+        "applied_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "current_stage": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "application_outcome": {
+          "enum": [
+            "active",
+            "rejected",
+            "withdrawn",
+            "joined",
+            "other",
+            "unknown"
+          ]
+        },
+        "joined_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_attribution_method": {
+          "enum": [
+            "last_touch_before_application",
+            "source_field_only",
+            "unknown"
+          ]
+        },
+        "source_evidence_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_system_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_record_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mapping_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ingest_run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "stage_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_id",
+        "stage_event_id",
+        "application_id",
+        "stage",
+        "entered_at",
+        "source_system_id",
+        "source_record_id",
+        "mapping_version",
+        "ingest_run_id"
+      ],
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stage_event_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "application_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stage": {
+          "enum": [
+            "applied",
+            "screened",
+            "interviewed",
+            "offered",
+            "joined",
+            "rejected",
+            "withdrawn",
+            "other",
+            "unknown"
+          ]
+        },
+        "entered_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "exited_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_system_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_record_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mapping_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ingest_run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_id",
+        "cost_id",
+        "source_channel",
+        "amount",
+        "currency",
+        "cost_period_start",
+        "cost_period_end",
+        "source_system_id",
+        "source_record_id",
+        "mapping_version",
+        "ingest_run_id"
+      ],
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cost_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_channel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "amount": {
+          "type": "number",
+          "minimum": 0
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        },
+        "cost_period_start": {
+          "$ref": "#/$defs/date"
+        },
+        "cost_period_end": {
+          "$ref": "#/$defs/date"
+        },
+        "requisition_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cost_category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_system_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_record_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "mapping_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ingest_run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

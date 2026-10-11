@@ -1,0 +1,3 @@
+client_id,cost_id,source_channel,amount,currency,cost_period_start,cost_period_end,requisition_id,cost_category,source_system_id,source_record_id,mapping_version,ingest_run_id
+demo_client,COST-001,Employee Referral,15000.00,INR,2026-01-01,2026-03-31,REQ-101,Referral bonus,demo_csv,COST-001,1.0,demo-run-001
+demo_client,COST-002,LinkedIn,25000.00,INR,2026-01-01,2026-03-31,,Campaign spend,demo_csv,COST-002,1.0,demo-run-001

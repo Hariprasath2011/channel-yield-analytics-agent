@@ -1,0 +1,130 @@
+{
+  "contract_version": "analytics_response_v1",
+  "status": "completed",
+  "client_id": "demo_client",
+  "scope": {
+    "requisition_id": null,
+    "cohort_start": "2026-01-01",
+    "cohort_end": "2026-06-30",
+    "as_of_date": "2026-10-11",
+    "observation_days": 90,
+    "hire_definition": "confirmed_joined_at_timestamp",
+    "yield_formula": "mature_confirmed_joins / mature_eligible_applications * 100",
+    "source_attribution_rule": "last recorded source channel before application when evidence exists; otherwise source field or unknown"
+  },
+  "requisition_context": [
+    {
+      "requisition_id": "REQ-101",
+      "job_title": "Data Analyst",
+      "role_family": "Analytics",
+      "status": "closed"
+    },
+    {
+      "requisition_id": "REQ-102",
+      "job_title": "Backend Engineer",
+      "role_family": "Engineering",
+      "status": "open"
+    }
+  ],
+  "summary": {
+    "applications_in_cohort": 5,
+    "known_source_applications": 4,
+    "unknown_source_applications": 1,
+    "source_coverage_percent": 80.0,
+    "confirmed_mature_joins": 1,
+    "channels_with_yield": 2,
+    "ranking_eligible_channels": 0
+  },
+  "channel_metrics": [
+    {
+      "channel": "Agency",
+      "applications_in_cohort": 1,
+      "mature_eligible_applications": 0,
+      "confirmed_joins": 0,
+      "mature_non_joins": 0,
+      "pending_or_immature": 1,
+      "yield_percent": null,
+      "yield_status": "not_applicable_no_mature_denominator",
+      "ranking_eligible": false,
+      "ranking_status": "minimum_sample_size_policy_not_configured"
+    },
+    {
+      "channel": "Employee Referral",
+      "applications_in_cohort": 2,
+      "mature_eligible_applications": 1,
+      "confirmed_joins": 1,
+      "mature_non_joins": 0,
+      "pending_or_immature": 1,
+      "yield_percent": 100.0,
+      "yield_status": "available",
+      "ranking_eligible": false,
+      "ranking_status": "minimum_sample_size_policy_not_configured"
+    },
+    {
+      "channel": "LinkedIn",
+      "applications_in_cohort": 1,
+      "mature_eligible_applications": 1,
+      "confirmed_joins": 0,
+      "mature_non_joins": 1,
+      "pending_or_immature": 0,
+      "yield_percent": 0.0,
+      "yield_status": "available",
+      "ranking_eligible": false,
+      "ranking_status": "minimum_sample_size_policy_not_configured"
+    }
+  ],
+  "ranked_channels": [],
+  "funnel": {
+    "available": true,
+    "stages": [
+      {
+        "stage": "applied",
+        "applications": 1
+      },
+      {
+        "stage": "screened",
+        "applications": 1
+      },
+      {
+        "stage": "interviewed",
+        "applications": 1
+      },
+      {
+        "stage": "offered",
+        "applications": 1
+      },
+      {
+        "stage": "joined",
+        "applications": 1
+      }
+    ]
+  },
+  "reported_costs": {
+    "available": true,
+    "groups": [
+      {
+        "channel": "Employee Referral",
+        "currency": "INR",
+        "reported_cost": 15000.0
+      },
+      {
+        "channel": "LinkedIn",
+        "currency": "INR",
+        "reported_cost": 25000.0
+      }
+    ],
+    "currency_conversion_performed": false,
+    "cost_per_hire_calculated": false
+  },
+  "data_quality": {
+    "unknown_source_applications": 1,
+    "pending_or_immature_applications_excluded": 2,
+    "warnings": [
+      "unknown_source_applications_excluded_from_named_channel_yield",
+      "ranking_disabled_until_minimum_sample_size_policy_is_configured",
+      "some_cost_records_are_not_requisition_allocated",
+      "pending_or_immature_outcomes_excluded_from_yield_denominator"
+    ]
+  },
+  "calculation_version": "yield_policy_v1"
+}

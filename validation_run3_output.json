@@ -1,0 +1,55 @@
+{
+  "base_fixture": {
+    "status": "PASS",
+    "error_count": 0,
+    "warning_count": 1,
+    "errors": [],
+    "warnings": [
+      "unknown_source_channel:APP-003"
+    ]
+  },
+  "negative_tests": [
+    {
+      "test": "duplicate application ID",
+      "result": "PASS",
+      "expected_signal": "application_duplicate_application_id"
+    },
+    {
+      "test": "missing application ID",
+      "result": "PASS",
+      "expected_signal": "application_missing_application_id"
+    },
+    {
+      "test": "invalid application timestamp",
+      "result": "PASS",
+      "expected_signal": "application_invalid_applied_at"
+    },
+    {
+      "test": "cross-tenant requisition reference",
+      "result": "PASS",
+      "expected_signal": "application_requisition_not_found_same_tenant"
+    },
+    {
+      "test": "missing join evidence",
+      "result": "PASS",
+      "expected_signal": "joined_outcome_missing_join_evidence"
+    },
+    {
+      "test": "invalid last-touch ordering",
+      "result": "PASS",
+      "expected_signal": "source_evidence_not_before_application"
+    },
+    {
+      "test": "bad stage timeline",
+      "result": "PASS",
+      "expected_signal": "stage_event_exited_before_entered"
+    },
+    {
+      "test": "unknown source is warned",
+      "result": "PASS",
+      "expected_signal": "unknown_source_channel"
+    }
+  ],
+  "negative_tests_passed": 8,
+  "negative_tests_total": 8
+}
