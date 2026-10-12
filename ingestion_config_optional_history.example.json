@@ -1,0 +1,19 @@
+{
+  "client_id": "demo_client",
+  "source_system_id": "demo_csv",
+  "mapping_version": "1.0",
+  "files": {
+    "requisitions": "requisitions.csv",
+    "applications": "applications.csv",
+    "stage_events": "stage_events.csv",
+    "costs": "costs_optional.csv"
+  },
+  "required_entities": [
+    "requisitions",
+    "applications"
+  ],
+  "optional_entities": [
+    "stage_events",
+    "costs"
+  ]
+}

@@ -31,8 +31,38 @@ def clean_value(value: Any) -> Any:
 
 
 def load_csv(path: Path) -> list[dict]:
+    """Read a CSV after validating its header and row shape."""
     with path.open(newline="", encoding="utf-8-sig") as f:
-        return [{k: clean_value(v) for k, v in row.items()} for row in csv.DictReader(f)]
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames
+        if not headers:
+            raise ValueError("csv_header_missing")
+        cleaned_headers = [h.strip() if isinstance(h, str) else "" for h in headers]
+        if any(not h for h in cleaned_headers):
+            raise ValueError("csv_header_blank")
+        if len(set(cleaned_headers)) != len(cleaned_headers):
+            raise ValueError("csv_header_duplicate")
+        reader.fieldnames = cleaned_headers
+        rows = []
+        for line_no, row in enumerate(reader, start=2):
+            if None in row:
+                raise ValueError(f"csv_row_has_extra_columns:line_{line_no}")
+            rows.append({k: clean_value(v) for k, v in row.items()})
+        return rows
+
+
+def resolve_input_path(base_dir: Path, filename: str) -> Path:
+    """Resolve an input path and prevent reads outside the configured input directory."""
+    if not isinstance(filename, str) or not filename.strip():
+        raise ValueError("input_filename_must_be_nonempty_string")
+    root = base_dir.resolve()
+    candidate = Path(filename)
+    resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("input_path_outside_base_dir") from exc
+    return resolved
 
 
 def normalize_row(raw: dict, entity: str, config: dict, run_id: str) -> dict:
@@ -121,18 +151,60 @@ def run_pipeline(config_path: Path, db_path: Path, base_dir: Path | None=None) -
     conn=sqlite3.connect(db_path); init_db(conn)
     accepted_by_entity={}
     try:
-        for entity, filename in config.get("files",{}).items():
-            if entity not in ENTITY_ID: report["warnings"].append(f"unsupported_entity_skipped:{entity}"); continue
-            path=base_dir/filename
+        files = config.get("files", {})
+        optional_entities = set(config.get("optional_entities", []))
+        # Backward-compatible default: configured files are required unless listed optional.
+        # Clients may now explicitly declare required_entities; any known entity not
+        # listed as required or optional is not expected for this client.
+        required_entities = set(config.get("required_entities", [e for e in files if e not in optional_entities]))
+        unknown_policy_entities = (required_entities | optional_entities) - set(ENTITY_ID)
+        if unknown_policy_entities:
+            raise ValueError(f"Unknown entities in required_entities/optional_entities: {sorted(unknown_policy_entities)}")
+        if required_entities & optional_entities:
+            raise ValueError("An entity cannot be both required and optional")
+
+        # Include explicitly optional/required entities even if no filename was supplied,
+        # so the report makes absent inputs visible instead of silently ignoring them.
+        expected_entities = list(dict.fromkeys([*files.keys(), *sorted(required_entities), *sorted(optional_entities)]))
+        for entity in expected_entities:
+            if entity not in ENTITY_ID:
+                report["warnings"].append(f"unsupported_entity_skipped:{entity}")
+                continue
+            filename = files.get(entity)
+            if not filename:
+                stats={"file":None,"read":0,"valid":0,"inserted":0,"updated":0,"unchanged_replays":0,"conflicts":0,"quarantined":0,"warnings":0}
+                if entity in optional_entities:
+                    stats["status"]="optional_file_not_configured"
+                    report["entities"][entity]=stats
+                    report["warnings"].append({"entity":entity,"warning":"optional_file_not_configured"})
+                    accepted_by_entity[entity]=[]
+                else:
+                    report["entities"][entity]={**stats,"status":"failed_file_not_configured"}
+                    report["status"]="failed"
+                continue
             stats={"file":filename,"read":0,"valid":0,"inserted":0,"updated":0,"unchanged_replays":0,"conflicts":0,"quarantined":0,"warnings":0}
+            try:
+                path=resolve_input_path(base_dir, filename)
+            except (TypeError, ValueError, OSError) as exc:
+                report["entities"][entity]={**stats,"status":"failed_path","error":str(exc)}
+                report["status"]="failed"
+                continue
             if not path.exists():
-                if entity in config.get("optional_entities",[]):
-                    stats["status"]="optional_file_missing"; report["entities"][entity]=stats; accepted_by_entity[entity]=[]; continue
-                report["entities"][entity]={**stats,"status":"failed_missing_file"}; report["status"]="failed"; continue
+                if entity in optional_entities:
+                    stats["status"]="optional_file_missing"
+                    report["entities"][entity]=stats
+                    report["warnings"].append({"entity":entity,"file":filename,"warning":"optional_file_missing"})
+                    accepted_by_entity[entity]=[]
+                    continue
+                report["entities"][entity]={**stats,"status":"failed_missing_file"}
+                report["status"]="failed"
+                continue
             try: raw_rows=load_csv(path)
             except Exception as exc:
                 report["entities"][entity]={**stats,"status":"failed_read","error":str(exc)}; report["status"]="failed"; continue
-            stats["read"]=len(raw_rows); good=[]
+            stats["read"]=len(raw_rows)
+            stats["status"]="loaded_empty" if not raw_rows else "loaded"
+            good=[]
             for line_no, raw in enumerate(raw_rows, start=2):
                 row=normalize_row(raw,entity,config,run_id)
                 errs=row_errors(row,entity)
@@ -144,6 +216,19 @@ def run_pipeline(config_path: Path, db_path: Path, base_dir: Path | None=None) -
                     good.append(row)
             accepted_by_entity[entity]=good; stats["valid"]=len(good)
             report["entities"][entity]=stats
+        # All-or-nothing policy: any required-file read/missing failure aborts the
+        # entire run before canonical records are written.
+        if report["status"] == "failed":
+            report["finished_at"] = datetime.now().astimezone().isoformat()
+            report["summary"] = {
+                "files_processed": len(report["entities"]),
+                "rows_read": sum(x["read"] for x in report["entities"].values()),
+                "inserted": 0, "updated": 0, "unchanged_replays": 0,
+                "conflicts": 0, "quarantined": len(report["quarantine"]),
+                "committed": False,
+            }
+            return report
+
         # Validate references against this batch plus already stored rows, before writing.
         staged={}
         for entity in ENTITIES:
@@ -168,12 +253,26 @@ def run_pipeline(config_path: Path, db_path: Path, base_dir: Path | None=None) -
                 if outcome=="conflict":
                     report["quarantine"].append({"entity":entity,"source_record_id":row.get("source_record_id"),"errors":["canonical_or_source_identity_conflict"],"record":row}); stats["quarantined"]+=1; stats["conflicts"]+=1
                 else: stats[{"unchanged_replay":"unchanged_replays"}.get(outcome,outcome)]+=1
-        conn.commit()
+        # Validate inside the transaction. If canonical semantic validation fails,
+        # roll back every write from this run rather than publishing invalid state.
         final_bundle=existing_bundle(conn,config["client_id"]); validation=validate_bundle(final_bundle)
         report["semantic_validation"]={"passed":validation["passed"],"errors":validation["errors"],"warnings":validation["warnings"]}
+        if not validation["passed"]:
+            conn.rollback()
+            report["status"] = "failed_validation"
+            report["finished_at"] = datetime.now().astimezone().isoformat()
+            report["summary"] = {
+                "files_processed": len(report["entities"]),
+                "rows_read": sum(x["read"] for x in report["entities"].values()),
+                "inserted": 0, "updated": 0, "unchanged_replays": 0,
+                "conflicts": sum(x["conflicts"] for x in report["entities"].values()),
+                "quarantined": len(report["quarantine"]), "committed": False,
+            }
+            return report
+        conn.commit()
         report["finished_at"]=datetime.now().astimezone().isoformat()
         report["status"]="completed_with_quarantine" if report["quarantine"] else ("completed_with_warnings" if report["warnings"] or validation["warnings"] else "completed")
-        report["summary"]={"files_processed":len(report["entities"]),"rows_read":sum(x["read"] for x in report["entities"].values()),"inserted":sum(x["inserted"] for x in report["entities"].values()),"updated":sum(x["updated"] for x in report["entities"].values()),"unchanged_replays":sum(x["unchanged_replays"] for x in report["entities"].values()),"conflicts":sum(x["conflicts"] for x in report["entities"].values()),"quarantined":len(report["quarantine"])}
+        report["summary"]={"files_processed":len(report["entities"]),"rows_read":sum(x["read"] for x in report["entities"].values()),"inserted":sum(x["inserted"] for x in report["entities"].values()),"updated":sum(x["updated"] for x in report["entities"].values()),"unchanged_replays":sum(x["unchanged_replays"] for x in report["entities"].values()),"conflicts":sum(x["conflicts"] for x in report["entities"].values()),"quarantined":len(report["quarantine"]),"committed":True}
         return report
     except Exception:
         conn.rollback(); raise
@@ -200,6 +299,124 @@ def self_test(folder: Path) -> dict:
         mapped_conn=sqlite3.connect(Path(td)/"mapped.sqlite")
         saved=json.loads(mapped_conn.execute("SELECT payload FROM canonical_records WHERE entity='requisitions'").fetchone()[0]); mapped_conn.close()
         results.append({"test":"client-specific source columns map to canonical fields","passed":saved.get("requisition_id")=="R-1" and saved.get("job_title")=="QA Engineer" and saved.get("source_record_id")=="SRC-1","actual":saved})
+
+        # Optional historical data may be absent; the rest of the run should commit.
+        optional_cfg={"client_id":"optional_client","source_system_id":"ats_x","mapping_version":"1.0",
+          "files":{"requisitions":"requisitions.csv","applications":"applications.csv","stage_events":"missing_history.csv"},
+          "optional_entities":["stage_events"]}
+        optional_cfg_path=Path(td)/"optional_config.json"; optional_cfg_path.write_text(json.dumps(optional_cfg),encoding="utf-8")
+        optional_run=run_pipeline(optional_cfg_path,Path(td)/"optional.sqlite",folder)
+        optional_status=optional_run["entities"].get("stage_events",{}).get("status")
+        results.append({"test":"missing optional historical file does not block import",
+          "passed":optional_run["summary"]["committed"] is True and optional_status=="optional_file_missing",
+          "actual":{"status":optional_run["status"],"stage_events_status":optional_status,"summary":optional_run["summary"]}})
+
+        # Missing required data must fail before any canonical rows are written.
+        required_cfg={"client_id":"required_client","source_system_id":"ats_x","mapping_version":"1.0",
+          "files":{"requisitions":"requisitions.csv","applications":"missing_applications.csv"},
+          "required_entities":["requisitions","applications"],"optional_entities":["stage_events","costs"]}
+        required_cfg_path=Path(td)/"required_config.json"; required_cfg_path.write_text(json.dumps(required_cfg),encoding="utf-8")
+        required_db=Path(td)/"required.sqlite"
+        required_run=run_pipeline(required_cfg_path,required_db,folder)
+        required_conn=sqlite3.connect(required_db)
+        required_rows=required_conn.execute("SELECT COUNT(*) FROM canonical_records WHERE client_id='required_client'").fetchone()[0]
+        required_conn.close()
+        results.append({"test":"missing required file aborts without canonical writes",
+          "passed":required_run["status"]=="failed" and required_run["summary"]["committed"] is False and required_rows==0,
+          "actual":{"status":required_run["status"],"summary":required_run["summary"],"canonical_rows":required_rows}})
+
+        # A required path that exists but cannot be opened must fail before writes.
+        unreadable_dir=Path(td)/"unreadable_requisitions.csv"
+        unreadable_dir.mkdir()  # Opening a directory as a CSV reliably raises an I/O error, including on elevated Windows accounts.
+        unreadable_cfg={"client_id":"unreadable_client","source_system_id":"ats_x","mapping_version":"1.0",
+          "files":{"requisitions":"unreadable_requisitions.csv","applications":"applications.csv"},
+          "required_entities":["requisitions","applications"],"optional_entities":["stage_events","costs"]}
+        unreadable_cfg_path=Path(td)/"unreadable_config.json"; unreadable_cfg_path.write_text(json.dumps(unreadable_cfg),encoding="utf-8")
+        unreadable_db=Path(td)/"unreadable.sqlite"
+        unreadable_run=run_pipeline(unreadable_cfg_path,unreadable_db,Path(td))
+        unreadable_conn=sqlite3.connect(unreadable_db)
+        unreadable_rows=unreadable_conn.execute("SELECT COUNT(*) FROM canonical_records WHERE client_id='unreadable_client'").fetchone()[0]
+        unreadable_conn.close()
+        unreadable_status=unreadable_run["entities"].get("requisitions",{}).get("status")
+        results.append({"test":"unreadable required file aborts without canonical writes",
+          "passed":unreadable_run["status"]=="failed" and unreadable_status=="failed_read" and unreadable_run["summary"]["committed"] is False and unreadable_rows==0,
+          "actual":{"status":unreadable_run["status"],"entity_status":unreadable_status,"summary":unreadable_run["summary"],"canonical_rows":unreadable_rows}})
+
+        # A header-only optional CSV is present-but-empty, not missing, and should not block a commit.
+        empty_history=Path(td)/"empty_history.csv"
+        empty_history.write_text("stage_event_id,application_id,stage,entered_at\\n",encoding="utf-8")
+        for fixture_name in ("requisitions.csv", "applications.csv"):
+            (Path(td)/fixture_name).write_bytes((folder/fixture_name).read_bytes())
+        empty_cfg={"client_id":"empty_history_client","source_system_id":"ats_x","mapping_version":"1.0",
+          "files":{"requisitions":"requisitions.csv","applications":"applications.csv","stage_events":"empty_history.csv"},
+          "required_entities":["requisitions","applications"],"optional_entities":["stage_events","costs"]}
+        empty_cfg_path=Path(td)/"empty_config.json"; empty_cfg_path.write_text(json.dumps(empty_cfg),encoding="utf-8")
+        empty_db=Path(td)/"empty.sqlite"
+        empty_run=run_pipeline(empty_cfg_path,empty_db,Path(td))
+        empty_status=empty_run["entities"].get("stage_events",{}).get("status")
+        results.append({"test":"empty optional historical CSV is distinct from missing and commits",
+          "passed":empty_run["summary"]["committed"] is True and empty_status=="loaded_empty" and empty_run["entities"]["stage_events"]["read"]==0,
+          "actual":{"status":empty_run["status"],"stage_events_status":empty_status,"rows_read":empty_run["entities"]["stage_events"]["read"],"summary":empty_run["summary"]}})
+
+        # Seed a database, then force semantic validation to fail after an update/insert is staged.
+        # This verifies transaction rollback preserves previously committed canonical records.
+        rollback_db=Path(td)/"rollback.sqlite"
+        seed_run=run_pipeline(cfg,rollback_db,folder)
+        def canonical_snapshot(db_path, client_id):
+            c=sqlite3.connect(db_path)
+            try:
+                return c.execute("SELECT entity, entity_id, fingerprint, payload FROM canonical_records WHERE client_id=? ORDER BY entity, entity_id",(client_id,)).fetchall()
+            finally:
+                c.close()
+        before_snapshot=canonical_snapshot(rollback_db, "demo_client")
+        changed_req=Path(td)/"rollback_requisitions.csv"
+        source_req=load_csv(folder/"requisitions.csv")
+        if source_req:
+            source_req[0]["job_title"]=(source_req[0].get("job_title") or "Role")+" - changed"
+        with changed_req.open("w",newline="",encoding="utf-8") as f:
+            writer=csv.DictWriter(f,fieldnames=list(source_req[0].keys()))
+            writer.writeheader(); writer.writerows(source_req)
+        for fixture_name in ("applications.csv", "stage_events.csv", "costs_optional.csv"):
+            (Path(td)/fixture_name).write_bytes((folder/fixture_name).read_bytes())
+        rollback_cfg={"client_id":"demo_client","source_system_id":"demo_csv","mapping_version":"1.0",
+          "files":{"requisitions":"rollback_requisitions.csv","applications":"applications.csv","stage_events":"stage_events.csv","costs":"costs_optional.csv"}}
+        rollback_cfg_path=Path(td)/"rollback_config.json"; rollback_cfg_path.write_text(json.dumps(rollback_cfg),encoding="utf-8")
+        original_validator=validate_bundle
+        try:
+            globals()["validate_bundle"] = lambda bundle: {"passed":False,"errors":["forced_test_validation_failure"],"warnings":[]}
+            rollback_run=run_pipeline(rollback_cfg_path,rollback_db,Path(td))
+        finally:
+            globals()["validate_bundle"] = original_validator
+        after_snapshot=canonical_snapshot(rollback_db, "demo_client")
+        results.append({"test":"semantic-validation failure rolls back and preserves existing records",
+          "passed":seed_run["summary"]["committed"] is True and rollback_run["status"]=="failed_validation" and rollback_run["summary"]["committed"] is False and before_snapshot==after_snapshot,
+          "actual":{"seed_committed":seed_run["summary"]["committed"],"status":rollback_run["status"],"summary":rollback_run["summary"],"records_preserved":before_snapshot==after_snapshot,"validation":rollback_run.get("semantic_validation")}})
+        # Input path traversal must fail before any canonical writes.
+        traversal_cfg={"client_id":"traversal_client","source_system_id":"demo_csv","mapping_version":"1.0",
+          "files":{"requisitions":"../requisitions.csv","applications":"applications.csv"},
+          "required_entities":["requisitions","applications"]}
+        (Path(td)/"applications.csv").write_bytes((folder/"applications.csv").read_bytes())
+        traversal_cfg_path=Path(td)/"traversal_config.json"; traversal_cfg_path.write_text(json.dumps(traversal_cfg),encoding="utf-8")
+        traversal_db=Path(td)/"traversal.sqlite"
+        traversal_run=run_pipeline(traversal_cfg_path,traversal_db,Path(td))
+        traversal_conn=sqlite3.connect(traversal_db)
+        traversal_rows=traversal_conn.execute("SELECT COUNT(*) FROM canonical_records WHERE client_id='traversal_client'").fetchone()[0]
+        traversal_conn.close()
+        results.append({"test":"path traversal is rejected before canonical writes",
+          "passed":traversal_run["status"]=="failed" and traversal_run["entities"]["requisitions"]["status"]=="failed_path" and traversal_rows==0,
+          "actual":{"status":traversal_run["status"],"entity_status":traversal_run["entities"]["requisitions"]["status"],"canonical_rows":traversal_rows}})
+
+        # Duplicate CSV headers must fail as an input-read error.
+        bad_header=Path(td)/"duplicate_header.csv"
+        bad_header.write_text("requisition_id,requisition_id,job_title,status\\nR-1,R-2,Engineer,open\\n",encoding="utf-8")
+        bad_header_cfg={"client_id":"header_client","source_system_id":"demo_csv","mapping_version":"1.0",
+          "files":{"requisitions":"duplicate_header.csv"},"required_entities":["requisitions"]}
+        bad_header_cfg_path=Path(td)/"bad_header_config.json"; bad_header_cfg_path.write_text(json.dumps(bad_header_cfg),encoding="utf-8")
+        bad_header_run=run_pipeline(bad_header_cfg_path,Path(td)/"bad_header.sqlite",Path(td))
+        results.append({"test":"duplicate CSV headers are rejected",
+          "passed":bad_header_run["status"]=="failed" and bad_header_run["entities"]["requisitions"]["status"]=="failed_read" and "csv_header_duplicate" in bad_header_run["entities"]["requisitions"].get("error",""),
+          "actual":{"status":bad_header_run["status"],"entity":bad_header_run["entities"]["requisitions"]}})
+
     return {"passed":sum(x["passed"] for x in results),"total":len(results),"tests":results}
 
 if __name__=="__main__":
