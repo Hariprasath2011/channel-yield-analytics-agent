@@ -1,1 +1,32 @@
-# Runtime uses Python standard library only.
+# Channel Yield Analytics Agent — Production Backend
+#
+# Production requirements. Version ranges are specified below.
+# Run: pip install -r requirements.txt
+#
+# Python >= 3.11 required.
+
+# --- Web framework ---
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.30.6,<1.0
+python-multipart>=0.0.12,<1.0
+
+# --- Settings & validation ---
+pydantic>=2.9.2,<3.0
+pydantic-settings>=2.14.0,<3.0
+
+# --- Persistence ---
+sqlalchemy>=2.0.36,<3.0
+alembic>=1.13.3,<2.0
+psycopg2-binary>=2.9.9,<3.0        # Use psycopg2 (no -binary) in production containers
+
+# --- Authentication ---
+python-jose[cryptography]>=3.3.0,<4.0
+passlib[bcrypt]>=1.7.4,<2.0
+
+# --- HTTP client (for Zoho Recruit API) ---
+httpx>=0.27.2,<1.0
+
+# --- Testing ---
+pytest>=8.3.3,<9.0
+pytest-asyncio>=0.24.0,<1.0
+anyio>=4.5.0,<5.0

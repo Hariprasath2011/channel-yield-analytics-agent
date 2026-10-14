@@ -2,58 +2,716 @@ openapi: 3.0.3
 info:
   title: Channel Yield Analytics API
   version: 1.0.0
-  description: Read-only prototype API. Tenant scope is configured on the server, not supplied by the caller.
+  description: >
+    Multi-tenant recruitment channel yield analytics and controlled agent query API.
+    Tenant identity is strictly derived from server-verified authenticated credentials (JWT or scoped API key).
+    Callers cannot supply, override, or spoof tenant identifiers.
+
 servers:
-  - url: https://YOUR-DEPLOYED-HOST
+  - url: https://channel-yield-analytics-agent.onrender.com
+    description: Hosted demo/staging environment
+  - url: http://localhost:8000
+    description: Local development environment
+
 paths:
   /health:
     get:
-      summary: Health check
+      summary: Liveness probe
+      description: Returns liveness status of the API service.
       security: []
       responses:
         '200':
-          description: API process is running
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: channel-yield-analytics-api
+                  api_version:
+                    type: string
+                    example: v2
+
+  /ready:
+    get:
+      summary: Readiness probe
+      description: Returns database connectivity readiness.
+      security: []
+      responses:
+        '200':
+          description: Service is ready
+        '503':
+          description: Database connectivity check failed
+
   /v1/analytics:
     get:
-      summary: Get recruitment channel analytics
-      description: Returns deterministic analytics for the server-configured client. Dates are application-cohort dates.
+      summary: Legacy v1 recruitment channel analytics (Backward Compatibility)
+      description: Returns deterministic analytics for server-configured client with legacy bearer token.
       security:
         - bearerAuth: []
       parameters:
         - in: query
           name: cohort_start
-          schema: {type: string, format: date, default: '2026-01-01'}
-          required: false
+          schema:
+            type: string
+            format: date
+            default: '2026-01-01'
         - in: query
           name: cohort_end
-          schema: {type: string, format: date, default: '2026-06-30'}
-          required: false
+          schema:
+            type: string
+            format: date
+            default: '2026-06-30'
         - in: query
           name: as_of_date
-          schema: {type: string, format: date}
-          required: false
+          schema:
+            type: string
+            format: date
         - in: query
           name: observation_days
-          schema: {type: integer, minimum: 0, default: 90}
-          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 90
         - in: query
           name: requisition_id
-          schema: {type: string}
-          required: false
+          schema:
+            type: string
         - in: query
           name: min_sample_size
-          description: Only supply after the client approves the ranking threshold.
-          schema: {type: integer, minimum: 1}
-          required: false
+          schema:
+            type: integer
+            minimum: 1
       responses:
-        '200': {description: Analytics response, schema: {type: object}}
-        '400': {description: Invalid parameters}
-        '401': {description: Missing or invalid bearer token}
-        '404': {description: Requisition not found within configured client}
-        '500': {description: Internal error}
-        '503': {description: Server configuration missing}
+        '200':
+          description: Legacy analytics response
+        '400':
+          description: Invalid parameters
+        '401':
+          description: Missing or invalid token
+        '404':
+          description: Requisition not found
+
+  /v2/auth/token:
+    post:
+      summary: Authenticate user and issue JWT
+      tags:
+        - Authentication
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - email
+                - password
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token:
+                    type: string
+                  token_type:
+                    type: string
+                    example: bearer
+                  expires_in:
+                    type: integer
+                    example: 3600
+        '401':
+          description: Invalid credentials or inactive account
+
+  /v2/auth/me:
+    get:
+      summary: Get authenticated identity profile
+      tags:
+        - Authentication
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: User and tenant profile
+        '401':
+          description: Missing or invalid authentication
+
+  /v2/auth/api-keys:
+    get:
+      summary: List tenant API keys (without secrets)
+      tags:
+        - Authentication
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: Active and revoked API keys; secrets are not returned
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ApiKeyItemResponse'
+        '401':
+          description: Missing or invalid authentication
+        '403':
+          description: Insufficient privileges
+    post:
+      summary: Issue a machine API key (admin only)
+      tags:
+        - Authentication
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  description: Description or name for the key
+      responses:
+        '201':
+          description: API key issued; plaintext secret returned once only
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyCreatedResponse'
+        '401':
+          description: Missing or invalid authentication
+        '403':
+          description: Insufficient privileges
+
+  /v2/auth/api-keys/{api_key_id}:
+    delete:
+      summary: Revoke API key (Admin/Owner only)
+      tags:
+        - Authentication
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - in: path
+          name: api_key_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: API key revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - id
+                properties:
+                  status:
+                    type: string
+                    enum: [revoked]
+                  id:
+                    type: string
+        '401':
+          description: Missing or invalid authentication
+        '404':
+          description: Key not found in tenant
+
+  /v2/auth/members:
+    get:
+      summary: List organization members (admin only)
+      tags:
+        - Authentication
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: Organization members
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MemberItemResponse'
+        '401':
+          description: Missing or invalid authentication
+        '403':
+          description: Insufficient privileges
+    post:
+      summary: Provision a new organization member (owner only)
+      tags:
+        - Authentication
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMemberRequest'
+      responses:
+        '201':
+          description: Organization member created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberItemResponse'
+        '401':
+          description: Missing or invalid authentication
+        '403':
+          description: Insufficient privileges
+
+  /v2/analytics:
+    get:
+      summary: Compute tenant recruitment channel yield analytics
+      tags:
+        - Channel Yield Analytics
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - in: query
+          name: cohort_start
+          description: Start date of application cohort (YYYY-MM-DD)
+          schema:
+            type: string
+            format: date
+            default: '2026-01-01'
+        - in: query
+          name: cohort_end
+          description: End date of application cohort (YYYY-MM-DD)
+          schema:
+            type: string
+            format: date
+            default: '2026-06-30'
+        - in: query
+          name: as_of_date
+          description: Maturity evaluation date (YYYY-MM-DD)
+          schema:
+            type: string
+            format: date
+        - in: query
+          name: observation_days
+          description: Observation window in days
+          schema:
+            type: integer
+            minimum: 0
+            default: 90
+        - in: query
+          name: requisition_id
+          description: Filter within authenticated tenant
+          schema:
+            type: string
+        - in: query
+          name: min_sample_size
+          description: Client-approved ranking sample size threshold
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        '200':
+          description: Authoritative channel yield analytics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contract_version:
+                    type: string
+                    example: analytics_response_v2
+                  status:
+                    type: string
+                    example: completed
+                  tenant_id:
+                    type: string
+                  channel_metrics:
+                    type: array
+                    items:
+                      type: object
+                  ranked_channels:
+                    type: array
+                    items:
+                      type: object
+                  data_quality:
+                    type: object
+        '400':
+          description: Invalid parameters or malformed dates
+        '401':
+          description: Missing or invalid authentication
+        '403':
+          description: Insufficient role permissions
+        '404':
+          description: Requisition not found within tenant
+
+  /v2/agent/query:
+    post:
+      summary: Execute typed allowlisted analytical query
+      description: >
+        Deterministic tool router executing only approved analytical operations.
+        Raw SQL, shell commands, arbitrary URLs, and unapproved operations are rejected.
+        Strictly requires analyst role or higher.
+      tags:
+        - Controlled Agent Tools
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - operation
+              properties:
+                operation:
+                  type: string
+                  enum:
+                    - query_channel_yield
+                    - query_requisition_summary
+                    - rank_recruitment_channels
+                    - get_data_quality_report
+                parameters:
+                  type: object
+      responses:
+        '200':
+          description: Deterministic analytical result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  operation:
+                    type: string
+                  execution_mode:
+                    type: string
+                    example: deterministic_rule_engine
+                  request_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  data:
+                    type: object
+        '400':
+          description: Prohibited parameter, unknown operation, or invalid payload
+        '401':
+          description: Missing or invalid authentication
+        '403':
+          description: Insufficient role permissions (requires analyst or higher)
+
+  /v2/ingestion/refresh:
+    post:
+      summary: Trigger an on-demand canonical ingestion refresh
+      tags:
+        - Data Ingestion & Refresh
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                source_system_id:
+                  type: string
+                  default: on_demand_refresh
+                mapping_version:
+                  type: string
+                  default: '1.0'
+                optional_entities:
+                  type: array
+                  items:
+                    type: string
+                csv_payloads:
+                  type: object
+                  additionalProperties:
+                    type: string
+      responses:
+        '200':
+          description: Ingestion job report
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden (Admin or Owner required)
+        '409':
+          description: Active import already in progress
+
+  /v2/ingestion/csv:
+    post:
+      summary: Upload CSV files for canonical ingestion
+      tags:
+        - Data Ingestion & Refresh
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                requisitions:
+                  type: string
+                  format: binary
+                applications:
+                  type: string
+                  format: binary
+                stage_events:
+                  type: string
+                  format: binary
+                costs:
+                  type: string
+                  format: binary
+                source_system_id:
+                  type: string
+                mapping_version:
+                  type: string
+      responses:
+        '200':
+          description: Ingestion job report
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden (Admin or Owner required)
+
+  /v2/ingestion/jobs:
+    get:
+      summary: List recent ingestion jobs for tenant
+      tags:
+        - Data Ingestion & Refresh
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: List of import jobs
+
+  /v2/ingestion/jobs/{job_id}:
+    get:
+      summary: Get details of a specific ingestion job
+      tags:
+        - Data Ingestion & Refresh
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - in: path
+          name: job_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job status and summary
+        '404':
+          description: Job not found within tenant
+
+  /v2/integrations/zoho/status:
+    get:
+      summary: Get Zoho Recruit connection status
+      tags:
+        - Zoho Recruit Integration
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: Connection status (no tokens exposed)
+
+  /v2/integrations/zoho/authorize:
+    post:
+      summary: Initiate Zoho Recruit OAuth authorization flow
+      tags:
+        - Zoho Recruit Integration
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - in: query
+          name: data_center
+          schema:
+            type: string
+            enum: [com, eu, in, au, jp, ca]
+            default: com
+      responses:
+        '200':
+          description: Authorization URL and CSRF state token
+        '403':
+          description: Forbidden (Admin or Owner required)
+
+  /v2/integrations/zoho/callback:
+    post:
+      summary: Exchange Zoho authorization code for tokens
+      tags:
+        - Zoho Recruit Integration
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - state
+                - code
+              properties:
+                state:
+                  type: string
+                code:
+                  type: string
+      responses:
+        '200':
+          description: OAuth tokens encrypted and saved
+        '400':
+          description: Invalid or expired state parameter
+
+  /v2/integrations/zoho/sync:
+    post:
+      summary: Trigger on-demand sync from Zoho Recruit
+      tags:
+        - Zoho Recruit Integration
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: Synchronization job report
+        '400':
+          description: Integration not active
+        '403':
+          description: Forbidden (Admin or Owner required)
+
 components:
+  schemas:
+    ApiKeyCreatedResponse:
+      type: object
+      required:
+        - id
+        - name
+        - key_prefix
+        - api_key
+        - created_at
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        key_prefix:
+          type: string
+        api_key:
+          type: string
+          writeOnly: true
+          description: Plaintext API key, returned only when the key is created
+        created_at:
+          type: string
+          format: date-time
+    ApiKeyItemResponse:
+      type: object
+      required:
+        - id
+        - name
+        - key_prefix
+        - is_active
+        - created_at
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        key_prefix:
+          type: string
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+    CreateMemberRequest:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+          nullable: true
+        password:
+          type: string
+          nullable: true
+          writeOnly: true
+        role:
+          type: string
+          enum: [viewer, analyst, admin, owner]
+          default: viewer
+    MemberItemResponse:
+      type: object
+      required:
+        - user_id
+        - email
+        - role
+        - is_active
+        - created_at
+      properties:
+        user_id:
+          type: string
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+          nullable: true
+        role:
+          type: string
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
+      bearerFormat: JWT
+      description: Authenticated user session JWT
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Scoped machine API key (cyk_...)
