@@ -1,0 +1,49 @@
+# Render Blueprint for Zoho Recruit Model Context Protocol (MCP) Service
+#
+# Independent deployment specification for the isolated MCP service.
+# Existing analytics service (render.yaml) and dummy demo (render-mcp-demo.yaml) remain untouched.
+#
+# AUTHENTICATION & ACCESS CONTROL:
+# Supports capability-path authentication via CY_MCP_SECRET_PATH_KEY for callers (e.g. iGentic)
+# that cannot provide custom HTTP authorization headers.
+# Production startup fails closed if neither CY_MCP_SECRET_PATH_KEY nor CY_MCP_AUTH_TOKEN is configured.
+
+services:
+  - type: web
+    name: zoho-recruit-mcp
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: "pip install -r requirements-mcp.txt"
+    startCommand: "python -m mcp_server.server --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: CY_ENV
+        value: production
+      - key: CY_MCP_HOST
+        value: 0.0.0.0
+      - key: CY_DATABASE_URL
+        sync: false
+        # Database connection URI (postgresql+psycopg2://...) to access tenant integration credentials
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+        # Fernet encryption key used to decrypt Zoho OAuth tokens at rest
+      - key: CY_MCP_TENANT_ID
+        sync: false
+        # Server-side tenant UUID. Resolves the single authorized tenant organization
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+        # Zoho Recruit OAuth 2.0 Client ID for token refresh
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+        # Zoho Recruit OAuth 2.0 Client Secret for token refresh
+      - key: CY_ZOHO_REDIRECT_URI
+        sync: false
+        # Registered OAuth 2.0 redirect URI
+      - key: CY_MCP_SECRET_PATH_KEY
+        sync: false
+        # High-entropy secret key for capability URL authentication (/sse/<key> and /messages/<key>).
+        # Required for iGentic since it cannot provide custom HTTP headers.
+      - key: CY_MCP_AUTH_TOKEN
+        sync: false
+        # Optional pre-shared bearer token for standard /sse and /messages endpoints (Authorization: Bearer <token>)
