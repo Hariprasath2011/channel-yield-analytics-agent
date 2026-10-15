@@ -57,11 +57,11 @@ class LoginRateLimiter:
         """Record a failed login attempt. Returns current attempt count in window."""
         now = time.time()
         with self._lock:
-            if len(self._failures) >= self.max_entries:
+            if key not in self._failures and len(self._failures) >= self.max_entries:
                 self._sweep(now)
-                # If still at capacity after sweep, evict oldest entry
+                # Never evict another key's active failure history.
                 if len(self._failures) >= self.max_entries:
-                    self._failures.pop(next(iter(self._failures)), None)
+                    return 0
 
             attempts = self._prune(key, now)
             attempts.append(now)
