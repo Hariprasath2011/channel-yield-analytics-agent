@@ -213,6 +213,24 @@ def test_fernet_token_encryption_and_decryption():
     with pytest.raises(OAuthError):
         decrypt_token("invalid_corrupt_cipher_text")
 
+def test_production_missing_encryption_key_fails_closed(monkeypatch):
+    from types import SimpleNamespace
+    from app.integrations.zoho import crypto
+
+    production_settings = SimpleNamespace(
+        is_production=True,
+        encryption_key="",
+        secret_key="a" * 64,
+    )
+    monkeypatch.setattr(
+        crypto,
+        "get_settings",
+        lambda: production_settings,
+    )
+
+    with pytest.raises(OAuthError, match="Encryption key is required"):
+        crypto._get_fernet()
+
 
 def test_mocked_token_exchange_and_sync(setup_data, db_session: Session):
     tenant = setup_data["tenant"]
