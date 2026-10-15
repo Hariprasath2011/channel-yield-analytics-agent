@@ -1,0 +1,17 @@
+# Separate Render Blueprint for Zoho Recruit Demo MCP Server
+# Completely isolated demo service returning fictional recruitment data for iGentic connectivity testing.
+# Requires NO database, Zoho OAuth credentials, encryption keys, or secrets.
+
+services:
+  - type: web
+    name: zoho-recruit-mcp-demo
+    runtime: python
+    buildCommand: pip install -r requirements-mcp-demo.txt
+    startCommand: python -m mcp_demo.server
+    plan: free
+    region: oregon
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHONUNBUFFERED
+        value: "1"
