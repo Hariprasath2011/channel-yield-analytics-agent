@@ -56,6 +56,15 @@ class ZohoRecruitClient:
         self.api_url = DATACENTER_DOMAINS[self.data_center]["api"]
         self._http = http_client or httpx.Client(timeout=30.0)
 
+    def set_data_center(self, data_center: str) -> None:
+        """Update data center and corresponding account/API endpoints."""
+        dc = data_center.lower().strip()
+        if dc not in DATACENTER_DOMAINS:
+            raise ValueError(f"Unsupported Zoho data center: {data_center}")
+        self.data_center = dc
+        self.accounts_url = DATACENTER_DOMAINS[dc]["accounts"]
+        self.api_url = DATACENTER_DOMAINS[dc]["api"]
+
     def get_authorization_url(self, state: str, scopes: Optional[list[str]] = None) -> str:
         """Construct the OAuth authorization redirect URL."""
         scope_str = ",".join(scopes or DEFAULT_SCOPES)
@@ -92,11 +101,22 @@ class ZohoRecruitClient:
 
         if resp.status_code == 429:
             raise RateLimitError("zoho_recruit", message="Zoho OAuth rate limit reached.")
-        payload = resp.json()
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.error("zoho.oauth_token_exchange_invalid_json")
+            raise OAuthError("Zoho token exchange returned an invalid response.") from exc
+        if not isinstance(payload, dict):
+            logger.error("zoho.oauth_token_exchange_invalid_payload")
+            raise OAuthError("Zoho token exchange returned an invalid response.")
         if "error" in payload or resp.status_code >= 400:
             err = payload.get("error", "token_exchange_failed")
             logger.error("zoho.oauth_token_exchange_failed", error=err)
             raise OAuthError(f"Zoho token exchange failed: {err}")
+        access_token = payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            logger.error("zoho.oauth_token_exchange_missing_access_token")
+            raise OAuthError("Zoho token response is missing a valid access_token.")
         return payload
 
     def refresh_access_token(self, refresh_token: str) -> dict[str, Any]:

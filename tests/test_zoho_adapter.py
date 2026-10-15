@@ -18,7 +18,16 @@ from app.integrations.zoho.mapper import map_zoho_application, map_zoho_job_open
 from app.integrations.zoho.service import ZohoService
 from app.main import create_app
 from app.persistence.database import Base, get_db
-from app.persistence.models import AuditEvent, CanonicalRecord, Membership, SyncJob, Tenant, User, ZohoIntegration
+from app.persistence.models import (
+    AuditEvent,
+    CanonicalRecord,
+    Membership,
+    OAuthState,
+    SyncJob,
+    Tenant,
+    User,
+    ZohoIntegration,
+)
 
 
 class MockZohoHttpClient:
@@ -368,7 +377,9 @@ def test_zoho_endpoints_rbac_and_status(setup_data, db_session: Session):
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         assert resp_auth_eu.status_code == 200
-        assert "accounts.zoho.eu" in resp_auth_eu.json()["authorization_url"]
+        eu_body = resp_auth_eu.json()
+        assert "accounts.zoho.eu" in eu_body["authorization_url"]
+        assert eu_body["state"].startswith("eu_")
 
         # Admin rejected with 400 when invalid data center is provided
         resp_auth_bad = test_client.post(
@@ -448,3 +459,314 @@ def test_zoho_stale_sync_recovery(setup_data, db_session: Session):
     )
     assert audit is not None
     assert audit.outcome == "failure"
+
+
+def _zoho_client(mock_http: MockZohoHttpClient | None = None, data_center: str = "com") -> ZohoRecruitClient:
+    return ZohoRecruitClient(
+        client_id="cid",
+        client_secret="sec",
+        redirect_uri="https://cb.test",
+        data_center=data_center,
+        http_client=mock_http or MockZohoHttpClient(),
+    )
+
+
+def _oauth_state_row(db_session: Session, state_token: str) -> OAuthState | None:
+    return db_session.query(OAuthState).filter(OAuthState.state_token == state_token).first()
+
+
+def test_oauth_state_accepted_once(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id, data_center="com")
+    assert state.startswith("com_")
+
+    integration = ZohoService.exchange_and_save_tokens(
+        db_session,
+        tenant_id=tenant.id,
+        state_token=state,
+        code="valid_auth_code",
+        client=client,
+    )
+    assert integration.status == "active"
+    db_session.expire_all()
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    assert row.used is True
+
+
+def test_oauth_state_cannot_be_reused_after_success(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+    ZohoService.exchange_and_save_tokens(
+        db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+    )
+    with pytest.raises(OAuthError, match="Invalid or expired OAuth state"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+        )
+
+
+def test_oauth_state_consumed_when_token_exchange_fails(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+    with pytest.raises(OAuthError):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=state, code="invalid_code", client=client
+        )
+    db_session.expire_all()
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    assert row.used is True
+    assert ZohoService.get_integration(db_session, tenant.id) is None
+    with pytest.raises(OAuthError, match="Invalid or expired OAuth state"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+        )
+
+
+def test_expired_oauth_state_is_rejected(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db_session.commit()
+
+    with pytest.raises(OAuthError, match="Invalid or expired OAuth state"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+        )
+    db_session.expire_all()
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    assert row.used is False
+    assert ZohoService.get_integration(db_session, tenant.id) is None
+
+
+def test_oauth_state_rejected_for_different_tenant(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    other = Tenant(slug="other-zoho-tenant", name="Other Tenant")
+    db_session.add(other)
+    db_session.commit()
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+
+    with pytest.raises(OAuthError, match="Invalid or expired OAuth state"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=other.id, state_token=state, code="valid_auth_code", client=client
+        )
+    db_session.expire_all()
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    assert row.used is False
+    assert row.tenant_id == tenant.id
+
+    integration = ZohoService.exchange_and_save_tokens(
+        db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+    )
+    assert integration.status == "active"
+
+
+def test_invalid_oauth_state_token_is_rejected(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    with pytest.raises(OAuthError, match="Invalid or expired OAuth state"):
+        ZohoService.exchange_and_save_tokens(
+            db_session,
+            tenant_id=tenant.id,
+            state_token="com_this_token_does_not_exist",
+            code="valid_auth_code",
+            client=client,
+        )
+
+
+def test_oauth_state_rejected_for_different_provider(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    row.provider = "other_provider"
+    db_session.commit()
+
+    with pytest.raises(OAuthError, match="Invalid or expired OAuth state"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+        )
+    db_session.expire_all()
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    assert row.used is False
+    assert row.provider == "other_provider"
+
+
+def test_concurrent_oauth_state_claim_not_proven_on_sqlite():
+    """SQLite cannot reliably prove PostgreSQL UPDATE atomicity under concurrent callbacks.
+
+    The claim uses a conditional UPDATE ... WHERE used=False AND expires_at > cutoff,
+    then commits before the Zoho HTTP call. Concurrent safety should be verified with
+    a PostgreSQL integration test that opens two sessions, starts both claims against
+    the same unused state row, and asserts exactly one success. See
+    tests/test_postgres_concurrency.py::test_postgres_concurrent_oauth_state_claim.
+    """
+    pytest.skip(
+        "Concurrent OAuth state claim races are not proven on SQLite; "
+        "run the PostgreSQL test when a disposable Postgres schema is available."
+    )
+
+
+def test_callback_uses_bound_non_default_data_center(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    mock_http = MockZohoHttpClient()
+    client = _zoho_client(mock_http, data_center="com")
+    state = ZohoService.create_oauth_state(db_session, tenant.id, data_center="eu")
+    assert state.startswith("eu_")
+
+    integration = ZohoService.exchange_and_save_tokens(
+        db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+    )
+    assert integration.data_center == "eu"
+    assert client.data_center == "eu"
+    assert client.accounts_url == DATACENTER_DOMAINS["eu"]["accounts"]
+    token_posts = [call for call in mock_http.call_history if call[0] == "POST"]
+    assert token_posts
+    assert token_posts[0][1].startswith("https://accounts.zoho.eu/")
+
+
+def test_data_center_prefix_tampering_is_rejected(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    mock_http = MockZohoHttpClient()
+    client = _zoho_client(mock_http, data_center="com")
+    state = ZohoService.create_oauth_state(db_session, tenant.id, data_center="eu")
+    _dc, raw = state.split("_", 1)
+    tampered = f"in_{raw}"
+
+    with pytest.raises(OAuthError, match="Invalid or expired OAuth state"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=tampered, code="valid_auth_code", client=client
+        )
+    assert not any(call[0] == "POST" for call in mock_http.call_history)
+    db_session.expire_all()
+    original = _oauth_state_row(db_session, state)
+    assert original is not None
+    assert original.used is False
+    assert ZohoService.get_integration(db_session, tenant.id) is None
+
+
+def test_token_response_missing_access_token_is_rejected(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+
+    def _missing_access(_code: str):
+        return {"refresh_token": "r", "expires_in": 3600}
+
+    client.exchange_code_for_tokens = _missing_access  # type: ignore[method-assign]
+    with pytest.raises(OAuthError, match="access_token"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+        )
+    db_session.expire_all()
+    assert _oauth_state_row(db_session, state).used is True
+    assert ZohoService.get_integration(db_session, tenant.id) is None
+
+
+def test_token_response_malformed_expires_in_is_rejected(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+
+    def _bad_expires(_code: str):
+        return {"access_token": "zoho_access_token_123", "expires_in": "not-a-number"}
+
+    client.exchange_code_for_tokens = _bad_expires  # type: ignore[method-assign]
+    with pytest.raises(OAuthError, match="expires_in"):
+        ZohoService.exchange_and_save_tokens(
+            db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+        )
+    db_session.expire_all()
+    assert ZohoService.get_integration(db_session, tenant.id) is None
+
+
+def test_empty_refresh_token_does_not_overwrite_existing(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    client = _zoho_client()
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+    integration = ZohoService.exchange_and_save_tokens(
+        db_session, tenant_id=tenant.id, state_token=state, code="valid_auth_code", client=client
+    )
+    original_refresh = integration.encrypted_refresh_token
+    assert original_refresh
+
+    state2 = ZohoService.create_oauth_state(db_session, tenant.id)
+
+    def _no_refresh(_code: str):
+        return {"access_token": "rotated_access_token", "refresh_token": "  ", "expires_in": 1800}
+
+    client.exchange_code_for_tokens = _no_refresh  # type: ignore[method-assign]
+    updated = ZohoService.exchange_and_save_tokens(
+        db_session, tenant_id=tenant.id, state_token=state2, code="valid_auth_code", client=client
+    )
+    assert decrypt_token(updated.encrypted_access_token) == "rotated_access_token"
+    assert updated.encrypted_refresh_token == original_refresh
+
+
+def test_production_zoho_client_fails_closed_when_config_missing(monkeypatch):
+    from types import SimpleNamespace
+    from app.integrations.zoho import router as zoho_router
+
+    def _settings(**overrides):
+        values = dict(
+            is_production=True,
+            zoho_client_id="client-id",
+            zoho_client_secret="client-secret",
+            zoho_redirect_uri="https://app.example/v2/integrations/zoho/callback",
+            zoho_data_center="com",
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    monkeypatch.setattr(zoho_router, "get_settings", lambda: _settings(zoho_client_id=""))
+    with pytest.raises(OAuthError, match="client ID"):
+        zoho_router._get_zoho_client()
+
+    monkeypatch.setattr(zoho_router, "get_settings", lambda: _settings(zoho_client_secret=""))
+    with pytest.raises(OAuthError, match="client secret"):
+        zoho_router._get_zoho_client()
+
+    monkeypatch.setattr(zoho_router, "get_settings", lambda: _settings(zoho_redirect_uri=""))
+    with pytest.raises(OAuthError, match="redirect URI"):
+        zoho_router._get_zoho_client()
+
+    monkeypatch.setattr(zoho_router, "get_settings", lambda: _settings(zoho_data_center="mars"))
+    with pytest.raises(OAuthError, match="data center"):
+        zoho_router._get_zoho_client()
+
+    monkeypatch.setattr(zoho_router, "get_settings", lambda: _settings())
+    client = zoho_router._get_zoho_client()
+    assert client.client_id == "client-id"
+    assert "dummy" not in client.client_id
+    assert "example.com" not in client.redirect_uri
+
+
+def test_non_production_allows_placeholder_zoho_client(monkeypatch):
+    from types import SimpleNamespace
+    from app.integrations.zoho import router as zoho_router
+
+    monkeypatch.setattr(
+        zoho_router,
+        "get_settings",
+        lambda: SimpleNamespace(
+            is_production=False,
+            zoho_client_id="",
+            zoho_client_secret="",
+            zoho_redirect_uri="",
+            zoho_data_center="com",
+        ),
+    )
+    client = zoho_router._get_zoho_client()
+    assert client.client_id == "dummy_client_id"

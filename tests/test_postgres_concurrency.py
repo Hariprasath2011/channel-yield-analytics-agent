@@ -25,11 +25,13 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
-from app.core.exceptions import ConflictError
+from app.core.exceptions import ConflictError, OAuthError
 from app.ingestion.service import IngestionService
 import app.ingestion.service as ing_mod
+from app.integrations.zoho.client import ZohoRecruitClient
+from app.integrations.zoho.service import ZohoService
 from app.persistence.database import Base
-from app.persistence.models import AuditEvent, ImportJob, Tenant
+from app.persistence.models import AuditEvent, ImportJob, OAuthState, Tenant, ZohoIntegration
 
 
 def _is_postgres_available() -> bool:
@@ -292,3 +294,77 @@ def test_postgres_concurrent_different_tenants_independent(
     j2 = pg_db.query(ImportJob).filter(ImportJob.tenant_id == t2.id).all()
     assert len(j1) == 1
     assert len(j2) == 1
+
+
+class _ConcurrentTokenHttp:
+    """Minimal Zoho token endpoint mock for concurrent claim tests."""
+
+    def post(self, url: str, data: dict):
+        class _Resp:
+            status_code = 200
+            headers = {}
+
+            def json(self):
+                return {
+                    "access_token": "concurrent_access",
+                    "refresh_token": "concurrent_refresh",
+                    "expires_in": 3600,
+                    "api_domain": "https://recruit.zoho.com",
+                    "scope": "ZohoRecruit.modules.ALL",
+                }
+
+        return _Resp()
+
+
+def test_postgres_concurrent_oauth_state_claim(
+    pg_session_factory: sessionmaker[Session],
+    pg_db: Session,
+):
+    """Exactly one of two concurrent callbacks may claim the same unused OAuth state."""
+    tenant = Tenant(
+        id=f"tenant-oauth-{uuid.uuid4().hex[:6]}",
+        slug=f"slug-oauth-{uuid.uuid4().hex[:6]}",
+        name="OAuth Claim Tenant",
+    )
+    pg_db.add(tenant)
+    pg_db.commit()
+
+    state = ZohoService.create_oauth_state(pg_db, tenant.id, data_center="com")
+    barrier = threading.Barrier(2)
+
+    def _worker() -> str:
+        client = ZohoRecruitClient(
+            client_id="cid",
+            client_secret="sec",
+            redirect_uri="https://cb.test",
+            data_center="com",
+            http_client=_ConcurrentTokenHttp(),
+        )
+        with pg_session_factory() as session:
+            barrier.wait()
+            try:
+                ZohoService.exchange_and_save_tokens(
+                    session,
+                    tenant_id=tenant.id,
+                    state_token=state,
+                    code="valid_auth_code",
+                    client=client,
+                )
+                return "success"
+            except OAuthError:
+                return "rejected"
+            except Exception as exc:
+                return f"error:{type(exc).__name__}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [f.result() for f in (executor.submit(_worker), executor.submit(_worker))]
+
+    assert sorted(outcomes) == ["rejected", "success"]
+    pg_db.expire_all()
+    row = pg_db.query(OAuthState).filter(OAuthState.state_token == state).one()
+    assert row.used is True
+    integrations = (
+        pg_db.query(ZohoIntegration).filter(ZohoIntegration.tenant_id == tenant.id).all()
+    )
+    assert len(integrations) == 1
+    assert integrations[0].status == "active"

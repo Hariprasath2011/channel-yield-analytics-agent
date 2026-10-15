@@ -11,7 +11,7 @@ from app.auth.dependencies import AuthenticatedContext, require_role
 from app.core.config import get_settings
 from app.core.exceptions import NotFoundError, OAuthError
 from app.core.logging import get_logger
-from app.integrations.zoho.client import ZohoRecruitClient
+from app.integrations.zoho.client import DATACENTER_DOMAINS, ZohoRecruitClient
 from app.integrations.zoho.service import ZohoService
 from app.persistence.database import get_db
 
@@ -39,16 +39,43 @@ class IntegrationStatusResponse(BaseModel):
     is_connected: bool
 
 
-VALID_DATA_CENTERS = {"com", "eu", "in", "au", "jp", "ca"}
+VALID_DATA_CENTERS = set(DATACENTER_DOMAINS.keys())
 
 
 def _get_zoho_client(data_center: Optional[str] = None) -> ZohoRecruitClient:
     settings = get_settings()
-    dc = data_center or settings.zoho_data_center or "com"
+    dc = (data_center or settings.zoho_data_center or "com").lower().strip()
+    if dc not in VALID_DATA_CENTERS:
+        raise OAuthError("Zoho OAuth configuration has an invalid data center.")
+
+    client_id = (settings.zoho_client_id or "").strip()
+    client_secret = (settings.zoho_client_secret or "").strip()
+    redirect_uri = (settings.zoho_redirect_uri or "").strip()
+
+    if settings.is_production:
+        missing = []
+        if not client_id:
+            missing.append("client ID")
+        if not client_secret:
+            missing.append("client secret")
+        if not redirect_uri:
+            missing.append("redirect URI")
+        if missing:
+            raise OAuthError(
+                "Zoho OAuth is not configured for production. "
+                f"Missing required setting(s): {', '.join(missing)}."
+            )
+        return ZohoRecruitClient(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            data_center=dc,
+        )
+
     return ZohoRecruitClient(
-        client_id=settings.zoho_client_id or "dummy_client_id",
-        client_secret=settings.zoho_client_secret or "dummy_client_secret",
-        redirect_uri=settings.zoho_redirect_uri or "https://api.example.com/v2/integrations/zoho/callback",
+        client_id=client_id or "dummy_client_id",
+        client_secret=client_secret or "dummy_client_secret",
+        redirect_uri=redirect_uri or "https://api.example.com/v2/integrations/zoho/callback",
         data_center=dc,
     )
 
@@ -100,7 +127,7 @@ def initiate_authorization(
                 "message": f"Unsupported Zoho data center: '{data_center}'. Allowed data centers: com, eu, in, au, jp, ca.",
             },
         )
-    state = ZohoService.create_oauth_state(db, ctx.tenant_id)
+    state = ZohoService.create_oauth_state(db, ctx.tenant_id, data_center=dc)
     client = _get_zoho_client(data_center=dc)
     auth_url = client.get_authorization_url(state=state)
     return AuthorizeResponse(authorization_url=auth_url, state=state)
@@ -116,7 +143,12 @@ def complete_callback(
     ctx: AuthenticatedContext = Depends(require_role("admin")),
     db: Session = Depends(get_db),
 ) -> IntegrationStatusResponse:
-    """Validate state and exchange auth code for tokens."""
+    """Validate state and exchange auth code for tokens.
+
+    The data center is not taken from a callback query parameter. After the
+    one-time state row is claimed, the service rebinds the client to the
+    data center encoded in that stored state token.
+    """
     client = _get_zoho_client()
     integration = ZohoService.exchange_and_save_tokens(
         db,
