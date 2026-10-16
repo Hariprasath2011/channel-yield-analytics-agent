@@ -395,7 +395,7 @@ def handle_browser_callback(
         return _render_callback_html(
             title="Authorization Successful",
             heading="Zoho Recruit Connected",
-            message="Your Zoho Recruit account has been successfully connected to Channel Yield Analytics. You may now close this window and return to your dashboard.",
+            message="Your Zoho Recruit account has been successfully connected to Channel Yield Analytics. You may now close this window and return to iGentic or your dashboard.",
             is_success=True,
             status_code=status.HTTP_200_OK,
         )

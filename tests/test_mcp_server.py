@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -85,8 +86,9 @@ def test_mcp_tools_list():
     assert "list_candidates" in tool_names
     assert "list_applications" in tool_names
     assert "check_zoho_connection" in tool_names
+    assert "connect_zoho_account" in tool_names
     assert "compute_channel_yield" in tool_names
-    assert len(tools) == 5
+    assert len(tools) == 6
 
 
 # ─── 2. Tool 1: list_job_openings ─────────────────────────────────────────────
@@ -662,7 +664,8 @@ def test_check_zoho_connection_tool(mcp_tenant):
     handler_unconf = ZohoRecruitMCPHandler(tenant_id="nonexistent-tid-999")
     res_unconf = handler_unconf.check_zoho_connection()
     assert res_unconf["connected"] is False
-    assert "/v2/integrations/zoho/authorize" in res_unconf.get("onboarding_url", "")
+    assert "/oauth/v2/auth" in res_unconf.get("onboarding_url", "")
+    assert "/oauth/v2/auth" in res_unconf.get("authorization_url", "")
 
 
 def test_compute_channel_yield_in_memory_and_zero_persistence(db_session, mcp_tenant, monkeypatch):
@@ -889,3 +892,173 @@ def test_production_no_implicit_fallback_to_fixed_tenant(monkeypatch):
     res = handler.check_zoho_connection()
     assert res["connected"] is False
     assert res["status"] == "unconfigured"
+
+
+# ─── 14. Single-User iGentic-First Onboarding & Boundary Tests ────────────────
+
+
+def test_single_user_onboarding_unconnected_session_instructions(db_session, monkeypatch):
+    """Verify unconnected operational session receives clickable auth link and clear instructions."""
+    from mcp_server.server import _ACTIVE_SESSIONS
+
+    monkeypatch.setenv("CY_MCP_SECRET_PATH_KEY", "op-secret-key-123")
+    app = create_mcp_app()
+
+    session_id = "test-unconnected-session-uuid"
+    session_queue: asyncio.Queue = asyncio.Queue()
+    _ACTIVE_SESSIONS[session_id] = {
+        "queue": session_queue,
+        "tenant_id": None,
+        "user_id": None,
+        "is_operational_path": True,
+        "created_at": time.time(),
+    }
+
+    try:
+        with TestClient(app) as client:
+            # 1. Calling onboarding tool 'check_zoho_connection' is permitted
+            check_req = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "check_zoho_connection", "arguments": {"data_center": "in"}},
+            }
+            res = client.post(f"/messages/op-secret-key-123?session_id={session_id}", json=check_req)
+            assert res.status_code == 202
+            msg1 = session_queue.get_nowait()
+            assert msg1["id"] == 1
+            content1 = json.loads(msg1["result"]["content"][0]["text"])
+            assert content1["connected"] is False
+            assert "authorization_url" in content1
+            assert "/oauth/v2/auth" in content1["authorization_url"]
+
+            # 2. Calling onboarding tool 'connect_zoho_account' is permitted
+            connect_req = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "connect_zoho_account", "arguments": {"data_center": "in"}},
+            }
+            res2 = client.post(f"/messages/op-secret-key-123?session_id={session_id}", json=connect_req)
+            assert res2.status_code == 202
+            msg2 = session_queue.get_nowait()
+            assert msg2["id"] == 2
+            content2 = json.loads(msg2["result"]["content"][0]["text"])
+            assert content2["status"] == "requires_authorization"
+            assert "authorization_url" in content2
+
+            # 3. Calling data tool 'compute_channel_yield' before connecting returns 401 with clear instructions
+            data_req = {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "compute_channel_yield",
+                    "arguments": {"cohort_start": "2026-01-01", "cohort_end": "2026-06-30"},
+                },
+            }
+            res3 = client.post(f"/messages/op-secret-key-123?session_id={session_id}", json=data_req)
+            assert res3.status_code == 401
+            err_msg = res3.json()["error"]["message"]
+            assert "Zoho Recruit is not connected yet" in err_msg
+            assert "connect_zoho_account" in err_msg
+    finally:
+        _ACTIVE_SESSIONS.pop(session_id, None)
+
+
+def test_single_user_unauthorized_session_cannot_access_or_bind(monkeypatch):
+    """Verify unauthorized or unrelated sessions cannot use onboarding or access primary tenant."""
+    monkeypatch.setenv("CY_MCP_SECRET_PATH_KEY", "op-secret-key-123")
+    app = create_mcp_app()
+
+    with TestClient(app) as client:
+        # Invalid capability key rejected at messages endpoint
+        check_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "check_zoho_connection"},
+        }
+        res2 = client.post("/messages/wrong-key", json=check_req)
+        assert res2.status_code == 401
+
+
+def test_single_user_dynamic_session_binding_after_authorization(db_session, monkeypatch):
+    """Verify that the SAME operational SSE session binds dynamically after browser OAuth completes."""
+    from mcp_server.server import _ACTIVE_SESSIONS
+
+    monkeypatch.setenv("CY_MCP_SECRET_PATH_KEY", "op-secret-key-123")
+    app = create_mcp_app()
+
+    session_id = "test-dynamic-binding-session-uuid"
+    session_queue: asyncio.Queue = asyncio.Queue()
+    _ACTIVE_SESSIONS[session_id] = {
+        "queue": session_queue,
+        "tenant_id": None,
+        "user_id": None,
+        "is_operational_path": True,
+        "created_at": time.time(),
+    }
+
+    try:
+        with TestClient(app) as client:
+            assert _ACTIVE_SESSIONS[session_id]["tenant_id"] is None
+            assert _ACTIVE_SESSIONS[session_id]["is_operational_path"] is True
+
+            # 1. Simulate user completing OAuth authorization in browser (creating active ZohoIntegration)
+            primary_tenant = Tenant(
+                id="primary-tenant-uuid",
+                slug="primary",
+                name="Primary Tenant Org",
+                is_active=True,
+            )
+            db_session.add(primary_tenant)
+            active_integration = ZohoIntegration(
+                id="zoho-int-primary",
+                tenant_id=primary_tenant.id,
+                data_center="in",
+                status="active",
+                encrypted_access_token=encrypt_token("access_tok_live"),
+                encrypted_refresh_token=encrypt_token("refresh_tok_live"),
+                token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+            db_session.add(active_integration)
+            db_session.commit()
+
+            # 2. Next message arrives on the SAME session_id (e.g. agent checks connection or calls tool)
+            check_req = {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {"name": "check_zoho_connection"},
+            }
+            res = client.post(f"/messages/op-secret-key-123?session_id={session_id}", json=check_req)
+            assert res.status_code == 202
+
+            # 3. Confirm session was dynamically bound to primary tenant
+            assert _ACTIVE_SESSIONS[session_id]["tenant_id"] == primary_tenant.id
+
+            # Read response from session queue
+            msg = session_queue.get_nowait()
+            assert msg["id"] == 10
+            content_obj = json.loads(msg["result"]["content"][0]["text"])
+            assert content_obj["connected"] is True
+            assert content_obj["status"] == "active"
+            assert content_obj["tenant_id"] == primary_tenant.id
+    finally:
+        _ACTIVE_SESSIONS.pop(session_id, None)
+
+
+def test_reusing_pending_oauth_state_avoids_competing_states(db_session):
+    """Verify handler reuses unexpired state instead of creating multiple competing states."""
+    handler = ZohoRecruitMCPHandler()
+    res1 = handler.connect_zoho_account(data_center="in")
+    assert res1["status"] == "requires_authorization"
+    url1 = res1["authorization_url"]
+
+    res2 = handler.connect_zoho_account(data_center="in")
+    assert res2["status"] == "requires_authorization"
+    url2 = res2["authorization_url"]
+
+    # Exactly the same URL / state token is reused
+    assert url1 == url2

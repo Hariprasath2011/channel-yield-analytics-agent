@@ -238,6 +238,33 @@ MCP_TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                "data_center": {
+                    "type": "string",
+                    "description": "Optional Zoho data center (e.g. 'in', 'com', 'eu'). Default is 'in'.",
+                    "enum": ["in", "com", "eu", "com.au", "com.cn", "jp"],
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "connect_zoho_account",
+        "description": (
+            "Initiate Zoho Recruit connection for this user's organization. "
+            "Returns a secure, clickable browser authorization link to connect your Zoho Recruit account."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data_center": {
+                    "type": "string",
+                    "description": "Zoho data center where your account is hosted (e.g. 'in', 'com', 'eu'). Defaults to 'in'.",
+                    "enum": ["in", "com", "eu", "com.au", "com.cn", "jp"],
+                    "default": "in",
+                },
                 "connection_token": {
                     "type": "string",
                     "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
@@ -381,26 +408,29 @@ class MCPServerDispatcher:
                     }
                 target_handler = ZohoRecruitMCPHandler(tenant_id=verified["tid"])
             elif not target_handler.tenant_id:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json.dumps({
-                                    "status": "error",
-                                    "error": "unauthorized",
-                                    "message": "No tenant is bound to this request or session. Please authenticate with a valid customer connection token."
-                                }, indent=2)
-                            }
-                        ],
-                        "isError": True,
+                if tool_name not in ("check_zoho_connection", "connect_zoho_account"):
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps({
+                                        "status": "error",
+                                        "error": "unauthorized",
+                                        "message": "No tenant is bound to this request or session. Please authenticate with a valid customer connection token."
+                                    }, indent=2)
+                                }
+                            ],
+                            "isError": True,
+                        }
                     }
-                }
 
             if tool_name == "check_zoho_connection":
-                result_data = target_handler.check_zoho_connection()
+                result_data = target_handler.check_zoho_connection(data_center=tool_args.get("data_center"))
+            elif tool_name == "connect_zoho_account":
+                result_data = target_handler.connect_zoho_account(data_center=str(tool_args.get("data_center", "in")))
             elif tool_name == "compute_channel_yield":
                 result_data = target_handler.compute_channel_yield(
                     cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
@@ -547,6 +577,14 @@ def _get_session_tenant_id(session_id: str) -> Optional[str]:
     return None
 
 
+def _is_operational_path_key(secret_key: str) -> bool:
+    """Check if the provided key matches the static operational path secret."""
+    if not secret_key:
+        return False
+    expected_key = os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip()
+    return bool(expected_key and hmac.compare_digest(secret_key, expected_key))
+
+
 def _verify_path_key(secret_key: str) -> bool:
     """Verify secret path key: either customer connection token or static path secret."""
     if not secret_key:
@@ -579,7 +617,12 @@ def _verify_bearer_token(request: Request) -> bool:
     return False
 
 
-def _create_sse_response(endpoint_data: str, tenant_id: Optional[str] = None, user_id: Optional[str] = None) -> StreamingResponse:
+def _create_sse_response(
+    endpoint_data: str,
+    tenant_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    is_operational_path: bool = False,
+) -> StreamingResponse:
     """Establish SSE session and stream MCP events to client with bound tenant context."""
     session_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue()
@@ -587,6 +630,7 @@ def _create_sse_response(endpoint_data: str, tenant_id: Optional[str] = None, us
         "queue": queue,
         "tenant_id": tenant_id,
         "user_id": user_id,
+        "is_operational_path": is_operational_path,
         "created_at": time.time(),
     }
 
@@ -623,7 +667,7 @@ async def sse_endpoint(request: Request) -> Response:
             {"error": "unauthorized", "message": "Authentication required for MCP SSE endpoint."},
             status_code=401,
         )
-    return _create_sse_response(endpoint_data="/messages")
+    return _create_sse_response(endpoint_data="/messages", is_operational_path=True)
 
 
 async def sse_capability_endpoint(request: Request) -> Response:
@@ -637,7 +681,13 @@ async def sse_capability_endpoint(request: Request) -> Response:
     verified = verify_user_connection_token(secret_key)
     tenant_id = verified["tid"] if verified else None
     user_id = verified.get("sub") if verified else None
-    return _create_sse_response(endpoint_data=f"/messages/{secret_key}", tenant_id=tenant_id, user_id=user_id)
+    is_operational = (verified is None)
+    return _create_sse_response(
+        endpoint_data=f"/messages/{secret_key}",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        is_operational_path=is_operational,
+    )
 
 
 async def _dispatch_incoming_message(request: Request) -> JSONResponse:
@@ -652,6 +702,8 @@ async def _dispatch_incoming_message(request: Request) -> JSONResponse:
         )
 
     is_tool_call = isinstance(body, dict) and body.get("method") == "tools/call"
+    url_secret_key = request.path_params.get("secret_key", "").strip()
+    is_operational_req = _is_operational_path_key(url_secret_key) or _verify_bearer_token(request)
 
     # Validate session_id if provided
     if session_id:
@@ -663,12 +715,25 @@ async def _dispatch_incoming_message(request: Request) -> JSONResponse:
                 status_code=404,
             )
         session_tenant_id = session_entry.get("tenant_id")
+        is_operational_session = bool(session_entry.get("is_operational_path")) or is_operational_req
     else:
         session_entry = None
         session_tenant_id = None
+        is_operational_session = is_operational_req
+
+    # Dynamic session binding for authenticated operational path sessions:
+    # If the session came through the configured operational MCP path and has no tenant bound yet,
+    # deterministically resolve the primary tenant and verify that its Zoho integration is active.
+    if is_operational_session and not session_tenant_id:
+        from mcp_server.zoho_recruit import get_primary_active_integration
+        active_integration = get_primary_active_integration()
+        if active_integration and active_integration.tenant_id:
+            session_tenant_id = active_integration.tenant_id
+            if session_entry:
+                session_entry["tenant_id"] = session_tenant_id
+            logger.info("mcp.dynamically_bound_operational_session", tenant_id=session_tenant_id)
 
     # Check capability path parameter token if present
-    url_secret_key = request.path_params.get("secret_key", "").strip()
     if url_secret_key and url_secret_key.startswith("cyct_"):
         verified_token = verify_user_connection_token(url_secret_key)
         if not verified_token:
@@ -689,14 +754,22 @@ async def _dispatch_incoming_message(request: Request) -> JSONResponse:
 
     # For tool executions, require an authenticated tenant bound to session, token, or argument
     if is_tool_call:
+        tool_name = body.get("params", {}).get("name") if isinstance(body, dict) else None
         tool_args = body.get("params", {}).get("arguments", {}) if isinstance(body, dict) else {}
         has_arg_token = bool(tool_args.get("connection_token"))
+        is_onboarding_tool = tool_name in ("check_zoho_connection", "connect_zoho_account")
         if not session_tenant_id and not has_arg_token:
-            return JSONResponse(
-                {"jsonrpc": "2.0", "id": body.get("id"),
-                 "error": {"code": -32003, "message": "Authentication required: no authorized tenant bound to this session."}},
-                status_code=401,
-            )
+            if not (is_operational_session and is_onboarding_tool):
+                msg = (
+                    "Zoho Recruit is not connected yet. Please call 'connect_zoho_account' or 'check_zoho_connection' to obtain the authorization link."
+                    if is_operational_session
+                    else "Authentication required: no authorized tenant bound to this session."
+                )
+                return JSONResponse(
+                    {"jsonrpc": "2.0", "id": body.get("id"),
+                     "error": {"code": -32003, "message": msg}},
+                    status_code=401,
+                )
 
     if session_tenant_id:
         dispatcher = MCPServerDispatcher(handler=ZohoRecruitMCPHandler(tenant_id=session_tenant_id))

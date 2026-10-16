@@ -32,7 +32,7 @@ from app.integrations.zoho.crypto import decrypt_token, encrypt_token
 from app.integrations.zoho.mapper import map_zoho_application, map_zoho_job_opening
 from app.integrations.zoho.service import ZohoService
 from app.persistence.database import get_db_context
-from app.persistence.models import ZohoIntegration
+from app.persistence.models import OAuthState, Tenant, ZohoIntegration
 
 logger = get_logger(__name__)
 
@@ -42,6 +42,48 @@ ALLOWED_MODULES = frozenset({"JobOpenings", "Candidates", "Applications"})
 # Bounded pagination defaults and limits
 DEFAULT_PER_PAGE = 20
 MAX_PER_PAGE = 100
+
+
+def get_primary_active_integration() -> Optional[ZohoIntegration]:
+    """Retrieve the single active Zoho integration for the primary tenant (single-user flow)."""
+    try:
+        with get_db_context() as db:
+            integration = (
+                db.query(ZohoIntegration)
+                .join(Tenant, Tenant.id == ZohoIntegration.tenant_id)
+                .filter(
+                    ZohoIntegration.status == "active",
+                    Tenant.is_active == True,
+                )
+                .order_by(ZohoIntegration.updated_at.desc(), ZohoIntegration.created_at.desc())
+                .first()
+            )
+            if integration and integration.tenant_id:
+                return integration
+    except Exception as exc:
+        logger.error("mcp.resolve_primary_integration_failed", error=type(exc).__name__)
+    return None
+
+
+def get_or_create_primary_tenant(db: Session) -> Tenant:
+    """Retrieve or create the single primary tenant for single-user operations."""
+    tenant = (
+        db.query(Tenant)
+        .filter(Tenant.is_active == True)
+        .order_by(Tenant.created_at.asc())
+        .first()
+    )
+    if not tenant:
+        import uuid
+        tenant = Tenant(
+            id=str(uuid.uuid4()),
+            slug="primary",
+            name="Primary Organization",
+            is_active=True,
+        )
+        db.add(tenant)
+        db.flush()
+    return tenant
 
 
 class ZohoRecruitMCPHandler:
@@ -335,40 +377,89 @@ class ZohoRecruitMCPHandler:
             logger.error("mcp.list_applications_unexpected_error", error=type(exc).__name__)
             return {"error": "integration_error", "message": "Failed to retrieve applications from Zoho Recruit."}
 
-    # ─── Tool 4: check_zoho_connection ───────────────────────────────────────
+    # ─── Tool 4: check_zoho_connection & connect_zoho_account ─────────────────
 
-    def check_zoho_connection(self) -> dict[str, Any]:
+    def _get_or_create_auth_url(
+        self, db: Session, tenant_id: str, data_center: Optional[str] = None
+    ) -> str:
+        """Generate or reuse an unexpired Zoho OAuth authorization URL."""
+        settings = get_settings()
+        dc = (data_center or getattr(settings, "zoho_data_center", None) or "in").lower().strip()
+        from app.integrations.zoho.service import VALID_DATA_CENTERS
+        if dc not in VALID_DATA_CENTERS:
+            dc = "in"
+
+        cutoff = datetime.now(timezone.utc)
+        existing_state = (
+            db.query(OAuthState)
+            .filter(
+                OAuthState.tenant_id == tenant_id,
+                OAuthState.provider == "zoho_recruit",
+                OAuthState.used == False,
+                OAuthState.expires_at > cutoff,
+            )
+            .order_by(OAuthState.created_at.desc())
+            .first()
+        )
+        if existing_state and existing_state.state_token.startswith(f"{dc}_"):
+            state_token = existing_state.state_token
+        else:
+            state_token = ZohoService.create_oauth_state(db, tenant_id, data_center=dc)
+
+        redirect_uri = settings.zoho_redirect_uri or "https://channel-yield-analytics-agent.onrender.com/v2/integrations/zoho/callback"
+        client = ZohoRecruitClient(
+            client_id=settings.zoho_client_id or "placeholder_client_id",
+            client_secret=settings.zoho_client_secret or "placeholder_client_secret",
+            redirect_uri=redirect_uri,
+            data_center=dc,
+        )
+        return client.get_authorization_url(state=state_token)
+
+    def check_zoho_connection(self, data_center: Optional[str] = None) -> dict[str, Any]:
         """Verify whether this user's organization has an active Zoho Recruit connection."""
-        if not self._tenant_id:
-            return {
-                "connected": False,
-                "status": "unconfigured",
-                "message": "No tenant ID is associated with this session. Please connect your Zoho Recruit account.",
-                "onboarding_action": "Authenticate or provide a valid user capability token.",
-            }
-
         try:
             with get_db_context() as db:
-                integration = ZohoService.get_integration(db, self._tenant_id)
-                if not integration or integration.status != "active":
+                target_tenant_id = self._tenant_id
+                if not target_tenant_id:
+                    primary_tenant = get_or_create_primary_tenant(db)
+                    target_tenant_id = primary_tenant.id
+
+                integration = ZohoService.get_integration(db, target_tenant_id)
+                if integration and integration.status == "active":
                     return {
-                        "connected": False,
-                        "status": integration.status if integration else "pending_auth",
-                        "tenant_id": self._tenant_id,
-                        "message": f"No active Zoho Recruit integration found for tenant '{self._tenant_id}'.",
-                        "onboarding_url": "/v2/integrations/zoho/authorize",
+                        "connected": True,
+                        "status": "active",
+                        "tenant_id": target_tenant_id,
+                        "data_center": integration.data_center,
+                        "zoho_org_id": integration.zoho_org_id,
+                        "last_sync_at": integration.last_sync_at.isoformat() if integration.last_sync_at else None,
                     }
+
+                auth_url = self._get_or_create_auth_url(db, target_tenant_id, data_center=data_center)
+                status_label = "unconfigured" if not self._tenant_id else (integration.status if integration else "pending_auth")
                 return {
-                    "connected": True,
-                    "status": "active",
-                    "tenant_id": self._tenant_id,
-                    "data_center": integration.data_center,
-                    "zoho_org_id": integration.zoho_org_id,
-                    "last_sync_at": integration.last_sync_at.isoformat() if integration.last_sync_at else None,
+                    "connected": False,
+                    "status": status_label,
+                    "tenant_id": target_tenant_id,
+                    "message": (
+                        "Zoho Recruit is not connected yet. Please authorize access by opening this link in your browser: "
+                        f"[Connect Zoho Recruit]({auth_url})\n\n"
+                        "Once you complete authorization in your browser, ask me to run your analysis."
+                    ),
+                    "authorization_url": auth_url,
+                    "onboarding_url": auth_url,
+                    "instructions": "Click the authorization URL to sign in to Zoho Recruit and grant access.",
                 }
         except Exception as exc:
             logger.error("mcp.check_connection_error", error=type(exc).__name__)
             return {"error": "database_error", "message": "Failed to check integration status."}
+
+    def connect_zoho_account(self, data_center: str = "in") -> dict[str, Any]:
+        """Generate a clickable Zoho Recruit OAuth authorization link to connect the account."""
+        res = self.check_zoho_connection(data_center=data_center)
+        if not res.get("connected"):
+            res["status"] = "requires_authorization"
+        return res
 
     # ─── Tool 5: compute_channel_yield (Live In-Memory Analytics) ─────────────
 
