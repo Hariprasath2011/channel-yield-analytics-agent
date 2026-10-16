@@ -1,6 +1,7 @@
 # Zoho Recruit Model Context Protocol (MCP) Server
 # Isolated dependencies for Render deployment of the MCP service
 
+fastapi>=0.115.0,<1.0
 starlette>=0.38.0,<1.0
 uvicorn[standard]>=0.30.0,<1.0
 httpx>=0.27.0,<1.0
