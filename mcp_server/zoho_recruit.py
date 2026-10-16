@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
+from app.analytics.adapter import compute_live_channel_yield
 from app.core.config import get_settings
 from app.core.exceptions import (
     ChannelYieldError,
@@ -28,6 +29,7 @@ from app.core.exceptions import (
 from app.core.logging import get_logger
 from app.integrations.zoho.client import ZohoRecruitClient
 from app.integrations.zoho.crypto import decrypt_token, encrypt_token
+from app.integrations.zoho.mapper import map_zoho_application, map_zoho_job_opening
 from app.integrations.zoho.service import ZohoService
 from app.persistence.database import get_db_context
 from app.persistence.models import ZohoIntegration
@@ -321,3 +323,190 @@ class ZohoRecruitMCPHandler:
         except Exception as exc:
             logger.error("mcp.list_applications_unexpected_error", error=type(exc).__name__)
             return {"error": "integration_error", "message": "Failed to retrieve applications from Zoho Recruit."}
+
+    # ─── Tool 4: check_zoho_connection ───────────────────────────────────────
+
+    def check_zoho_connection(self) -> dict[str, Any]:
+        """Verify whether this user's organization has an active Zoho Recruit connection."""
+        if not self._tenant_id:
+            return {
+                "connected": False,
+                "status": "unconfigured",
+                "message": "No tenant ID is associated with this session. Please connect your Zoho Recruit account.",
+                "onboarding_action": "Authenticate or provide a valid user capability token.",
+            }
+
+        try:
+            with get_db_context() as db:
+                integration = ZohoService.get_integration(db, self._tenant_id)
+                if not integration or integration.status != "active":
+                    return {
+                        "connected": False,
+                        "status": integration.status if integration else "pending_auth",
+                        "tenant_id": self._tenant_id,
+                        "message": f"No active Zoho Recruit integration found for tenant '{self._tenant_id}'.",
+                        "onboarding_url": "/v2/integrations/zoho/authorize",
+                    }
+                return {
+                    "connected": True,
+                    "status": "active",
+                    "tenant_id": self._tenant_id,
+                    "data_center": integration.data_center,
+                    "zoho_org_id": integration.zoho_org_id,
+                    "last_sync_at": integration.last_sync_at.isoformat() if integration.last_sync_at else None,
+                }
+        except Exception as exc:
+            logger.error("mcp.check_connection_error", error=type(exc).__name__)
+            return {"error": "database_error", "message": "Failed to check integration status."}
+
+    # ─── Tool 5: compute_channel_yield (Live In-Memory Analytics) ─────────────
+
+    def compute_channel_yield(
+        self,
+        cohort_start: str,
+        cohort_end: str,
+        as_of_date: Optional[str] = None,
+        observation_days: int = 90,
+        requisition_id: Optional[str] = None,
+        min_sample_size: int = 5,
+    ) -> dict[str, Any]:
+        """Retrieve live Zoho Recruit records, map in memory, and calculate deterministic channel yield.
+
+        Zero-Data-Persistence Guarantee:
+            Raw job openings, candidate profiles, and applications are never saved to database tables,
+            CSV files, temporary SQLite files, or persistent caches.
+        """
+        if not self._tenant_id:
+            return {
+                "status": "error",
+                "error": "unconfigured_tenant",
+                "message": "Session has no configured tenant ID. Please connect your Zoho Recruit account first.",
+            }
+
+        try:
+            # 1. Obtain authenticated Zoho client and access token
+            with get_db_context() as db:
+                client, access_token = self._get_authenticated_client(db)
+
+            # 2. Fetch live records across required modules (bounded to reasonable pagination limits)
+            raw_jobs = client.fetch_all_module_records("JobOpenings", access_token, max_pages=10)
+            raw_candidates = client.fetch_all_module_records("Candidates", access_token, max_pages=20)
+            raw_applications = client.fetch_all_module_records("Applications", access_token, max_pages=20)
+
+            # 3. Construct candidate source attribution map in memory
+            candidate_source_map: dict[str, str] = {}
+            for cand in raw_candidates:
+                cand_id = str(cand.get("id") or "")
+                if cand_id:
+                    src = cand.get("Source") or cand.get("Lead_Source") or "unknown"
+                    candidate_source_map[cand_id] = str(src).strip()
+
+            # 4. Map records in memory using canonical schema mappers (transient dictionaries)
+            canonical_jobs = [
+                map_zoho_job_opening(rec, self._tenant_id, "live_mcp_run")
+                for rec in raw_jobs
+            ]
+            canonical_apps = [
+                map_zoho_application(rec, candidate_source_map, self._tenant_id, "live_mcp_run")
+                for rec in raw_applications
+            ]
+
+            # 5. Execute in-memory yield analytics engine
+            calculation_as_of = as_of_date or datetime.now(timezone.utc).date().isoformat()
+            metrics = compute_live_channel_yield(
+                tenant_id=self._tenant_id,
+                requisitions=canonical_jobs,
+                applications=canonical_apps,
+                stage_events=[],  # Explicitly empty: no fabricated events
+                costs=[],         # Explicitly empty: no fabricated costs
+                cohort_start=cohort_start,
+                cohort_end=cohort_end,
+                as_of_date=calculation_as_of,
+                observation_days=max(0, int(observation_days)),
+                requisition_id=requisition_id,
+                min_sample_size=max(1, int(min_sample_size)) if min_sample_size is not None else None,
+            )
+
+            # 6. Generate deterministic, evidence-based recommendations
+            recommendations: list[str] = []
+            ranked = metrics.get("ranked_channels", [])
+            summary = metrics.get("summary", {})
+            total_apps = summary.get("applications_in_cohort", 0)
+            confirmed_hires = summary.get("confirmed_mature_joins", 0)
+
+            if total_apps == 0:
+                recommendations.append(
+                    f"No applications were submitted during the selected cohort window ({cohort_start} to {cohort_end}). "
+                    "Verify your date filter or confirm recent candidate activity in Zoho Recruit."
+                )
+            elif confirmed_hires == 0:
+                recommendations.append(
+                    f"Across {total_apps} application(s) in this cohort, 0 confirmed hires have matured within the "
+                    f"{observation_days}-day observation window. Check whether candidates are still active in pipeline or increase the cohort range."
+                )
+            elif ranked:
+                top_channel = ranked[0]
+                recommendations.append(
+                    f"Top Performing Channel: '{top_channel['channel']}' achieved the highest mature yield ({top_channel['yield_percent']}%) "
+                    f"with {top_channel['confirmed_joins']} confirmed hire(s) out of {top_channel['mature_eligible_applications']} mature candidate(s)."
+                )
+                if len(ranked) > 1:
+                    lowest_channel = ranked[-1]
+                    if lowest_channel["yield_percent"] < top_channel["yield_percent"]:
+                        recommendations.append(
+                            f"Channel Review: '{lowest_channel['channel']}' demonstrated a mature yield of {lowest_channel['yield_percent']}% "
+                            f"({lowest_channel['confirmed_joins']} hire(s) / {lowest_channel['mature_eligible_applications']} mature apps). "
+                            "Consider evaluating channel screening criteria or reallocating recruitment focus."
+                        )
+            else:
+                recommendations.append(
+                    f"Hires exist ({confirmed_hires} confirmed), but individual channel volume did not meet the "
+                    f"configured ranking threshold (min_sample_size = {min_sample_size}). "
+                    "Lower min_sample_size or expand cohort range to generate authoritative channel rankings."
+                )
+
+            data_qual = metrics.get("data_quality", {})
+            unknown_apps = data_qual.get("unknown_source_applications", 0)
+            if unknown_apps > 0:
+                recommendations.append(
+                    f"Data Quality Notice: {unknown_apps} application(s) lacked channel attribution and were excluded "
+                    "from named channel yield calculations. Ensure recruiters capture Lead Source in Zoho Recruit."
+                )
+
+            limitations = [
+                "Recruitment costs are not tracked in Zoho Recruit; cost-per-hire and ROI metrics require external cost inputs.",
+                "Granular stage-to-stage transition timelines are not provided by Zoho module records; funnel conversion requires persistent stage events.",
+            ]
+
+            return {
+                "status": "completed",
+                "analysis_period": {
+                    "cohort_start": cohort_start,
+                    "cohort_end": cohort_end,
+                    "as_of_date": calculation_as_of,
+                    "observation_days": observation_days,
+                },
+                "summary": summary,
+                "ranked_channels": ranked,
+                "channel_metrics": metrics.get("channel_metrics", []),
+                "historical_funnel": {
+                    "available": False,
+                    "stages": None,
+                    "reason": "Zoho Recruit module APIs return current status only; historical stage transitions require timeline logging.",
+                },
+                "recommendations": recommendations,
+                "data_quality": data_qual,
+                "limitations": limitations,
+            }
+
+        except RateLimitError as exc:
+            return {"status": "error", "error": "rate_limited", "message": str(exc.message)}
+        except (OAuthError, NotFoundError, ValidationError, IntegrationError) as exc:
+            return {
+                "status": "error",
+                "error": exc.code if hasattr(exc, "code") else "error",
+                "message": str(exc.message if hasattr(exc, "message") else exc),
+            }
+        except Exception as exc:
+            logger.error("mcp.compute_channel_yield_unexpected_error", error=type(exc).__name__)
+            return {"status": "error", "error": "calculation_error", "message": "Failed to calculate channel yield from Zoho Recruit data."}

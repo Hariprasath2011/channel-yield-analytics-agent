@@ -15,8 +15,13 @@ from app.core.config import Settings
 from app.core.exceptions import RateLimitError, ValidationError
 from app.integrations.zoho.crypto import decrypt_token, encrypt_token
 from app.persistence.database import get_db_context
-from app.persistence.models import Tenant, ZohoIntegration
-from mcp_server.server import MCPServerDispatcher, create_mcp_app
+from app.persistence.models import CanonicalRecord, Tenant, ZohoIntegration
+from mcp_server.server import (
+    MCPServerDispatcher,
+    create_mcp_app,
+    create_user_connection_token,
+    verify_user_connection_token,
+)
 from mcp_server.zoho_recruit import (
     ALLOWED_MODULES,
     ZohoRecruitMCPHandler,
@@ -79,7 +84,9 @@ def test_mcp_tools_list():
     assert "list_job_openings" in tool_names
     assert "list_candidates" in tool_names
     assert "list_applications" in tool_names
-    assert len(tools) == 3
+    assert "check_zoho_connection" in tool_names
+    assert "compute_channel_yield" in tool_names
+    assert len(tools) == 5
 
 
 # ─── 2. Tool 1: list_job_openings ─────────────────────────────────────────────
@@ -638,3 +645,148 @@ def test_end_to_end_sse_message_delivery_for_real_tool(mcp_tenant, monkeypatch):
             _ACTIVE_SESSIONS.pop(session_id, None)
 
     asyncio.run(_run())
+
+
+# ─── 12. Live In-Memory Analytics & Zero-Persistence Tests ────────────────────
+
+
+def test_check_zoho_connection_tool(mcp_tenant):
+    """Verify check_zoho_connection reports active connection for configured tenant."""
+    handler = ZohoRecruitMCPHandler(tenant_id=mcp_tenant.id)
+    res = handler.check_zoho_connection()
+    assert res["connected"] is True
+    assert res["status"] == "active"
+    assert res["tenant_id"] == mcp_tenant.id
+
+    # Unconfigured / missing tenant returns connected=False
+    handler_unconf = ZohoRecruitMCPHandler(tenant_id="nonexistent-tid-999")
+    res_unconf = handler_unconf.check_zoho_connection()
+    assert res_unconf["connected"] is False
+    assert "/v2/integrations/zoho/authorize" in res_unconf.get("onboarding_url", "")
+
+
+def test_compute_channel_yield_in_memory_and_zero_persistence(db_session, mcp_tenant, monkeypatch):
+    """Verify live yield calculation runs in memory and persists ZERO recruitment records to database."""
+    handler = ZohoRecruitMCPHandler(tenant_id=mcp_tenant.id)
+
+    mock_jobs = [
+        {"id": "job_1", "Job_Opening_ID": "REQ-01", "Posting_Title": "Lead Architect", "Job_Opening_Status": "open"}
+    ]
+    mock_candidates = [
+        {"id": "cand_1", "Source": "LinkedIn"},
+        {"id": "cand_2", "Source": "Referral"},
+    ]
+    mock_applications = [
+        {
+            "id": "app_1",
+            "Job_Opening_ID": "REQ-01",
+            "Candidate_ID": "cand_1",
+            "Application_Status": "Joined",
+            "Created_Time": "2026-01-10T10:00:00Z",
+            "Joining_Date": "2026-02-15T10:00:00Z",
+        },
+        {
+            "id": "app_2",
+            "Job_Opening_ID": "REQ-01",
+            "Candidate_ID": "cand_2",
+            "Application_Status": "Rejected",
+            "Created_Time": "2026-01-12T10:00:00Z",
+        },
+    ]
+
+    def _mock_fetch(module, token, max_pages=10):
+        if module == "JobOpenings":
+            return mock_jobs
+        if module == "Candidates":
+            return mock_candidates
+        if module == "Applications":
+            return mock_applications
+        return []
+
+    with patch("app.integrations.zoho.client.ZohoRecruitClient.fetch_all_module_records", side_effect=_mock_fetch):
+        res = handler.compute_channel_yield(
+            cohort_start="2026-01-01",
+            cohort_end="2026-03-31",
+            observation_days=30,
+            as_of_date="2026-04-01",
+            min_sample_size=1,
+        )
+
+    assert res["status"] == "completed"
+    assert res["summary"]["applications_in_cohort"] == 2
+    assert res["summary"]["confirmed_mature_joins"] == 1
+
+    # Check ranked channels
+    ranked = res["ranked_channels"]
+    assert len(ranked) >= 1
+    top = ranked[0]
+    assert top["channel"] == "LinkedIn"
+    assert top["yield_percent"] == 100.0
+
+    # Verify recommendations exist
+    assert len(res["recommendations"]) > 0
+    assert any("Top Performing Channel" in rec for rec in res["recommendations"])
+
+    # Verify historical funnel limitation notice
+    assert res["historical_funnel"]["available"] is False
+    assert "reason" in res["historical_funnel"]
+    assert len(res["limitations"]) == 2
+
+    # CRITICAL: Verify ZERO records were written to CanonicalRecord table
+    record_count = db_session.query(CanonicalRecord).count()
+    assert record_count == 0
+
+
+def test_cryptographic_connection_token_isolation(db_session, mcp_tenant):
+    """Verify that a signed connection token scopes execution strictly to that user's tenant."""
+    # Create second tenant
+    tenant_b = Tenant(id="tenant-isolated-b", slug="isolated-b", name="Tenant B", is_active=True)
+    db_session.add(tenant_b)
+    db_session.commit()
+
+    token_b = create_user_connection_token(tenant_id=tenant_b.id, user_id="user-b-123")
+    assert token_b.startswith("cyct_")
+
+    verified = verify_user_connection_token(token_b)
+    assert verified is not None
+    assert verified["tid"] == tenant_b.id
+    assert verified["sub"] == "user-b-123"
+
+    dispatcher = MCPServerDispatcher()
+    call_req = {
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "tools/call",
+        "params": {
+            "name": "check_zoho_connection",
+            "arguments": {"connection_token": token_b},
+        },
+    }
+
+    # Tenant B has no Zoho integration, so check_zoho_connection must report tenant B's status
+    resp = dispatcher.dispatch(call_req)
+    assert resp["id"] == 99
+    content = json.loads(resp["result"]["content"][0]["text"])
+    assert content["connected"] is False
+    assert content["tenant_id"] == tenant_b.id
+
+
+def test_tampered_or_invalid_connection_token_rejected():
+    """Verify that forged, tampered, or guessed connection tokens are rejected with error."""
+    dispatcher = MCPServerDispatcher()
+
+    for invalid_token in ["cyct_fakepayload.invalidsig", "arbitrary_user_id", "cyct_onlyonepart"]:
+        call_req = {
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "check_zoho_connection",
+                "arguments": {"connection_token": invalid_token},
+            },
+        }
+        resp = dispatcher.dispatch(call_req)
+        assert resp["result"]["isError"] is True
+        content = json.loads(resp["result"]["content"][0]["text"])
+        assert content["error"] == "unauthorized"
+        assert "Invalid, expired, or tampered" in content["message"]

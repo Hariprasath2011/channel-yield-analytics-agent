@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import hmac
 import json
 import os
 import sys
+import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, Optional
 
@@ -33,6 +36,65 @@ logger = get_logger(__name__)
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "zoho-recruit-mcp"
 SERVER_VERSION = "1.0.0"
+
+
+def _get_signing_secret() -> str:
+    """Resolve trusted server-side secret key for cryptographic token signing."""
+    return (
+        os.getenv("CY_SECRET_KEY", "").strip()
+        or os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip()
+        or os.getenv("CY_ENCRYPTION_KEY", "").strip()
+        or "channel-yield-mcp-internal-secret-fallback"
+    )
+
+
+def create_user_connection_token(
+    tenant_id: str,
+    user_id: str,
+    secret: Optional[str] = None,
+    expire_days: int = 30,
+) -> str:
+    """Generate a tamper-proof HMAC-SHA256 connection token binding an MCP session to a user's tenant."""
+    sec = secret or _get_signing_secret()
+    payload = {
+        "tid": str(tenant_id).strip(),
+        "sub": str(user_id).strip(),
+        "exp": int(time.time()) + (expire_days * 86400),
+    }
+    payload_b64 = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("utf-8").rstrip("=")
+    sig = hmac.new(sec.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"cyct_{payload_b64}.{sig}"
+
+
+def verify_user_connection_token(
+    token: str,
+    secret: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Verify cryptographic signature and expiry of a user connection token.
+
+    Returns the decoded payload dict if valid, or None if invalid, expired, or tampered.
+    """
+    if not token or not isinstance(token, str) or not token.startswith("cyct_") or "." not in token:
+        return None
+    sec = secret or _get_signing_secret()
+    raw = token[5:]
+    try:
+        payload_b64, sig = raw.rsplit(".", 1)
+        expected_sig = hmac.new(sec.encode("utf-8"), payload_b64.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected_sig):
+            return None
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("utf-8")))
+        if payload.get("exp", 0) < time.time():
+            return None
+        if not payload.get("tid"):
+            return None
+        return payload
+    except Exception:
+        return None
+
 
 # Tool specifications conform to Model Context Protocol JSON Schema
 MCP_TOOLS = [
@@ -127,6 +189,67 @@ MCP_TOOLS = [
             },
         },
     },
+    {
+        "name": "check_zoho_connection",
+        "description": (
+            "Verify whether this user's organization has an active Zoho Recruit connection. "
+            "Returns connection status and onboarding URL if not connected."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "compute_channel_yield",
+        "description": (
+            "Compute recruitment channel yield, mature hire conversion rates, and evidence-based recommendations "
+            "directly from live Zoho Recruit data. Operates entirely in memory without persisting recruitment records."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cohort_start": {
+                    "type": "string",
+                    "description": "ISO start date of application cohort (YYYY-MM-DD), e.g., '2026-01-01'.",
+                },
+                "cohort_end": {
+                    "type": "string",
+                    "description": "ISO end date of application cohort (YYYY-MM-DD), e.g., '2026-06-30'.",
+                },
+                "as_of_date": {
+                    "type": "string",
+                    "description": "Optional calculation as-of date (default: today).",
+                },
+                "observation_days": {
+                    "type": "integer",
+                    "description": "Observation days for outcome maturity (default 90).",
+                    "default": 90,
+                    "minimum": 0,
+                },
+                "requisition_id": {
+                    "type": "string",
+                    "description": "Optional requisition identifier filter.",
+                },
+                "min_sample_size": {
+                    "type": "integer",
+                    "description": "Minimum sample size for ranking eligibility (default 5).",
+                    "default": 5,
+                    "minimum": 1,
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+            "required": ["cohort_start", "cohort_end"],
+        },
+    },
 ]
 
 
@@ -174,20 +297,56 @@ class MCPServerDispatcher:
             tool_name = params.get("name")
             tool_args = params.get("arguments") or {}
 
-            if tool_name == "list_job_openings":
-                result_data = self.handler.list_job_openings(
+            # Cryptographically verify per-user connection token if provided in tool arguments
+            target_handler = self.handler
+            conn_token = tool_args.get("connection_token")
+            if conn_token:
+                verified = verify_user_connection_token(str(conn_token).strip())
+                if not verified:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps({
+                                        "status": "error",
+                                        "error": "unauthorized",
+                                        "message": "Invalid, expired, or tampered connection token."
+                                    }, indent=2)
+                                }
+                            ],
+                            "isError": True,
+                        }
+                    }
+                target_handler = ZohoRecruitMCPHandler(tenant_id=verified["tid"])
+
+            if tool_name == "check_zoho_connection":
+                result_data = target_handler.check_zoho_connection()
+            elif tool_name == "compute_channel_yield":
+                result_data = target_handler.compute_channel_yield(
+                    cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
+                    cohort_end=str(tool_args.get("cohort_end", "2026-06-30")),
+                    as_of_date=tool_args.get("as_of_date"),
+                    observation_days=int(tool_args.get("observation_days", 90)),
+                    requisition_id=tool_args.get("requisition_id"),
+                    min_sample_size=int(tool_args.get("min_sample_size", 5)),
+                )
+            elif tool_name == "list_job_openings":
+                result_data = target_handler.list_job_openings(
                     page=tool_args.get("page", 1),
                     per_page=tool_args.get("per_page", 20),
                     status=tool_args.get("status"),
                 )
             elif tool_name == "list_candidates":
-                result_data = self.handler.list_candidates(
+                result_data = target_handler.list_candidates(
                     page=tool_args.get("page", 1),
                     per_page=tool_args.get("per_page", 20),
                     source=tool_args.get("source"),
                 )
             elif tool_name == "list_applications":
-                result_data = self.handler.list_applications(
+                result_data = target_handler.list_applications(
                     page=tool_args.get("page", 1),
                     per_page=tool_args.get("per_page", 20),
                     job_opening_id=tool_args.get("job_opening_id"),
@@ -203,7 +362,7 @@ class MCPServerDispatcher:
                     },
                 }
 
-            is_error = "error" in result_data
+            is_error = "error" in result_data or result_data.get("status") == "error"
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -278,12 +437,28 @@ async def health_check(_request: Request) -> JSONResponse:
     })
 
 
+def _get_session_queue(session_id: str) -> Optional[asyncio.Queue]:
+    entry = _ACTIVE_SESSIONS.get(session_id)
+    if isinstance(entry, asyncio.Queue):
+        return entry
+    if isinstance(entry, dict):
+        return entry.get("queue")
+    return None
+
+
+def _get_session_tenant_id(session_id: str) -> Optional[str]:
+    entry = _ACTIVE_SESSIONS.get(session_id)
+    if isinstance(entry, dict):
+        return entry.get("tenant_id")
+    return None
+
+
 def _verify_path_key(secret_key: str) -> bool:
-    """Verify high-entropy secret path key using constant-time comparison."""
+    """Verify high-entropy secret path key using constant-time comparison or signed user token."""
     expected_key = os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip()
-    if not expected_key or not secret_key:
-        return False
-    return hmac.compare_digest(secret_key, expected_key)
+    if expected_key and secret_key and hmac.compare_digest(secret_key, expected_key):
+        return True
+    return verify_user_connection_token(secret_key) is not None
 
 
 def _verify_bearer_token(request: Request) -> bool:
@@ -304,11 +479,11 @@ def _verify_bearer_token(request: Request) -> bool:
     return False
 
 
-def _create_sse_response(endpoint_data: str) -> StreamingResponse:
-    """Establish SSE session and stream MCP events to client."""
+def _create_sse_response(endpoint_data: str, tenant_id: Optional[str] = None) -> StreamingResponse:
+    """Establish SSE session and stream MCP events to client with optional bound tenant context."""
     session_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue()
-    _ACTIVE_SESSIONS[session_id] = queue
+    _ACTIVE_SESSIONS[session_id] = {"queue": queue, "tenant_id": tenant_id}
 
     async def event_generator() -> AsyncGenerator[bytes, None]:
         # Initial MCP endpoint event
@@ -354,7 +529,9 @@ async def sse_capability_endpoint(request: Request) -> Response:
             {"error": "unauthorized", "message": "Invalid or missing capability key."},
             status_code=401,
         )
-    return _create_sse_response(endpoint_data=f"/messages/{secret_key}")
+    verified = verify_user_connection_token(secret_key)
+    tenant_id = verified["tid"] if verified else None
+    return _create_sse_response(endpoint_data=f"/messages/{secret_key}", tenant_id=tenant_id)
 
 
 async def _dispatch_incoming_message(request: Request) -> JSONResponse:
@@ -368,12 +545,18 @@ async def _dispatch_incoming_message(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    dispatcher = getattr(request.app.state, "dispatcher", None) or MCPServerDispatcher()
+    session_tenant_id = _get_session_tenant_id(session_id) if session_id else None
+    if session_tenant_id:
+        dispatcher = MCPServerDispatcher(handler=ZohoRecruitMCPHandler(tenant_id=session_tenant_id))
+    else:
+        dispatcher = getattr(request.app.state, "dispatcher", None) or MCPServerDispatcher()
+
     response_payload = dispatcher.dispatch(body)
 
-    if session_id and session_id in _ACTIVE_SESSIONS:
+    sess_queue = _get_session_queue(session_id) if session_id else None
+    if sess_queue is not None:
         if response_payload is not None:
-            await _ACTIVE_SESSIONS[session_id].put(response_payload)
+            await sess_queue.put(response_payload)
         return JSONResponse({"status": "accepted"}, status_code=202)
 
     # Direct JSON response fallback if no active SSE session

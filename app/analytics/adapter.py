@@ -30,7 +30,10 @@ logger = get_logger(__name__)
 # Import the existing analytics engine (preserved from prototype).
 # This import works because the repo root is on the Python path.
 try:
-    from analytics_service import compute_analytics as _compute_analytics
+    from analytics_service import (
+        compute_analytics as _compute_analytics,
+        compute_analytics_from_records as _compute_analytics_from_records,
+    )
     _ANALYTICS_AVAILABLE = True
 except ImportError:
     _ANALYTICS_AVAILABLE = False
@@ -105,69 +108,69 @@ def compute_tenant_analytics(
         costs=len(costs),
     )
 
-    # Write to a temp SQLite DB for the existing engine.
-    # TODO (Phase E): Refactor analytics_service to accept data directly
-    # and eliminate this SQLite intermediary step.
-    import sqlite3
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-
-    try:
-        conn = sqlite3.connect(tmp_path)
-        conn.execute(
-            "CREATE TABLE canonical_records "
-            "(entity TEXT, client_id TEXT, entity_id TEXT, "
-            "source_system_id TEXT, source_record_id TEXT, "
-            "fingerprint TEXT, payload TEXT, "
-            "PRIMARY KEY(entity, client_id, entity_id))"
-        )
-        for entity, records in [
-            ("requisitions", reqs),
-            ("applications", apps),
-            ("stage_events", events),
-            ("costs", costs),
-        ]:
-            for rec in records:
-                entity_id_field = {
-                    "requisitions": "requisition_id",
-                    "applications": "application_id",
-                    "stage_events": "stage_event_id",
-                    "costs": "cost_id",
-                }.get(entity, "id")
-                conn.execute(
-                    "INSERT OR IGNORE INTO canonical_records VALUES (?,?,?,?,?,?,?)",
-                    (
-                        entity,
-                        tenant_id,
-                        rec.get(entity_id_field, ""),
-                        rec.get("source_system_id", ""),
-                        rec.get("source_record_id", ""),
-                        "",
-                        json.dumps(rec),
-                    ),
-                )
-        conn.commit()
-        conn.close()
-
-        result = _compute_analytics(
-            tmp_path,
-            client_id=tenant_id,
-            cohort_start=cohort_start,
-            cohort_end=cohort_end,
-            as_of_date=as_of_date,
-            observation_days=observation_days,
-            requisition_id=requisition_id,
-            min_sample_size=min_sample_size,
-        )
-    finally:
-        try:
-            tmp_path.unlink()
-        except Exception:
-            pass
+    # Delegate directly to in-memory engine (eliminating SQLite intermediary)
+    result = _compute_analytics_from_records(
+        client_id=tenant_id,
+        requisitions=reqs,
+        applications=apps,
+        stage_events=events,
+        costs=costs,
+        cohort_start=cohort_start,
+        cohort_end=cohort_end,
+        as_of_date=as_of_date,
+        observation_days=observation_days,
+        requisition_id=requisition_id,
+        min_sample_size=min_sample_size,
+    )
 
     if result.get("status") == "not_found":
         raise NotFoundError("Requisition")
 
     return result
+
+
+def compute_live_channel_yield(
+    *,
+    tenant_id: str,
+    requisitions: list[dict],
+    applications: list[dict],
+    stage_events: Optional[list[dict]] = None,
+    costs: Optional[list[dict]] = None,
+    cohort_start: str,
+    cohort_end: str,
+    as_of_date: str,
+    observation_days: int,
+    requisition_id: Optional[str] = None,
+    min_sample_size: Optional[int] = None,
+) -> dict:
+    """Compute channel yield directly on in-memory mapped Zoho collections.
+
+    Zero-data-persistence: Collections are never written to database tables or files.
+    """
+    if not _ANALYTICS_AVAILABLE:
+        raise AnalyticsError("Analytics engine is not available.")
+
+    # Validate dates
+    try:
+        start_d = date.fromisoformat(cohort_start)
+        end_d = date.fromisoformat(cohort_end)
+        as_of_d = date.fromisoformat(as_of_date)
+    except ValueError as exc:
+        raise AnalyticsError(f"Invalid date: {exc}") from exc
+
+    if end_d < start_d:
+        raise AnalyticsError("cohort_end must be on or after cohort_start.")
+
+    return _compute_analytics_from_records(
+        client_id=tenant_id,
+        requisitions=requisitions,
+        applications=applications,
+        stage_events=stage_events or [],
+        costs=costs or [],
+        cohort_start=cohort_start,
+        cohort_end=cohort_end,
+        as_of_date=as_of_date,
+        observation_days=observation_days,
+        requisition_id=requisition_id,
+        min_sample_size=min_sample_size,
+    )

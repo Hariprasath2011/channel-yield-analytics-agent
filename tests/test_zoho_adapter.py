@@ -770,3 +770,564 @@ def test_non_production_allows_placeholder_zoho_client(monkeypatch):
     )
     client = zoho_router._get_zoho_client()
     assert client.client_id == "dummy_client_id"
+
+
+# ─── Browser GET Callback Tests ───────────────────────────────────────────────
+
+
+def _setup_browser_test_app(db_session: Session, mock_http: MockZohoHttpClient):
+    """Helper to configure a TestClient with overridden DB and mock Zoho client."""
+    from app.integrations.zoho import router as zoho_router
+
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    def _mock_client(data_center: str | None = None) -> ZohoRecruitClient:
+        return ZohoRecruitClient(
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+            redirect_uri="https://channel-yield-analytics-agent.onrender.com/v2/integrations/zoho/callback",
+            data_center=data_center or "com",
+            http_client=mock_http,
+        )
+
+    return app, _mock_client
+
+
+def test_browser_callback_success(setup_data, db_session: Session, monkeypatch):
+    tenant = setup_data["tenant"]
+    mock_http = MockZohoHttpClient()
+    app, mock_client_factory = _setup_browser_test_app(db_session, mock_http)
+    from app.integrations.zoho import router as zoho_router
+
+    monkeypatch.setattr(zoho_router, "_get_zoho_client", mock_client_factory)
+
+    state = ZohoService.create_oauth_state(db_session, tenant.id, data_center="com")
+
+    with TestClient(app) as client:
+        resp = client.get(
+            f"/v2/integrations/zoho/callback?code=valid_auth_code_123&state={state}"
+        )
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+
+        # Security headers
+        assert resp.headers["cache-control"] == "no-store, no-cache, must-revalidate, private"
+        assert resp.headers["referrer-policy"] == "no-referrer"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert "default-src 'none'" in resp.headers["content-security-policy"]
+
+        # Content verification: generic success message, no leaked tokens/secrets
+        body = resp.text
+        assert "Zoho Recruit Connected" in body
+        assert "valid_auth_code_123" not in body
+        assert state not in body
+        assert "test_client_secret" not in body
+        assert tenant.id not in body
+
+    # Database verification: integration record is active
+    db_session.expire_all()
+    integration = ZohoService.get_integration(db_session, tenant.id)
+    assert integration is not None
+    assert integration.status == "active"
+    assert integration.encrypted_access_token is not None
+    assert decrypt_token(integration.encrypted_access_token) == "zoho_access_token_123"
+
+
+def test_browser_callback_missing_parameters(setup_data, db_session: Session):
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    with TestClient(app) as client:
+        # Both missing
+        resp1 = client.get("/v2/integrations/zoho/callback")
+        assert resp1.status_code == 400
+        assert "Missing Parameters" in resp1.text
+
+        # State missing
+        resp2 = client.get("/v2/integrations/zoho/callback?code=some_code")
+        assert resp2.status_code == 400
+        assert "Missing Parameters" in resp2.text
+
+        # Code missing
+        resp3 = client.get("/v2/integrations/zoho/callback?state=com_some_state")
+        assert resp3.status_code == 400
+        assert "Missing Parameters" in resp3.text
+
+
+def test_browser_callback_malformed_parameters(setup_data, db_session: Session):
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/v2/integrations/zoho/callback?code=bad<script>alert(1)</script>&state=com_valid"
+        )
+        assert resp.status_code == 400
+        assert "Malformed Parameters" in resp.text
+        assert "<script>" not in resp.text  # Untrusted input is NOT reflected
+
+
+def test_browser_callback_consent_denial(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+
+    with TestClient(app) as client:
+        resp = client.get(
+            f"/v2/integrations/zoho/callback?error=access_denied&error_description=User+declined&state={state}"
+        )
+        assert resp.status_code == 200
+        assert "Authorization Cancelled" in resp.text
+        assert "access_denied" not in resp.text
+
+    # State row must be safely invalidated to prevent replay
+    db_session.expire_all()
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    assert row.used is True
+
+
+def test_browser_callback_consent_denial_invalid_and_nonexistent_states(setup_data, db_session: Session):
+    tenant = setup_data["tenant"]
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    # 1. Nonexistent state does not error or alter any records
+    with TestClient(app) as client:
+        resp_nonexistent = client.get(
+            "/v2/integrations/zoho/callback?error=access_denied&state=com_nonexistent_state_token_12345"
+        )
+        assert resp_nonexistent.status_code == 200
+        assert "Authorization Cancelled" in resp_nonexistent.text
+
+    # 2. Malformed state token is safely ignored
+    with TestClient(app) as client:
+        resp_malformed = client.get(
+            "/v2/integrations/zoho/callback?error=access_denied&state=bad<script>alert(1)</script>"
+        )
+        assert resp_malformed.status_code == 200
+        assert "Authorization Cancelled" in resp_malformed.text
+        assert "<script>" not in resp_malformed.text
+
+    # 3. Already used state cannot be re-invalidated or cause errors
+    used_state = ZohoService.create_oauth_state(db_session, tenant.id)
+    row = _oauth_state_row(db_session, used_state)
+    assert row is not None
+    row.used = True
+    db_session.commit()
+
+    with TestClient(app) as client:
+        resp_used = client.get(
+            f"/v2/integrations/zoho/callback?error=access_denied&state={used_state}"
+        )
+        assert resp_used.status_code == 200
+        assert "Authorization Cancelled" in resp_used.text
+
+    # 4. Expired state cannot be mutated by denial
+    expired_state = ZohoService.create_oauth_state(db_session, tenant.id)
+    exp_row = _oauth_state_row(db_session, expired_state)
+    assert exp_row is not None
+    exp_row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db_session.commit()
+
+    with TestClient(app) as client:
+        resp_exp = client.get(
+            f"/v2/integrations/zoho/callback?error=access_denied&state={expired_state}"
+        )
+        assert resp_exp.status_code == 200
+        assert "Authorization Cancelled" in resp_exp.text
+        # Row remains used=False because it was expired and thus excluded from invalidation
+        db_session.expire_all()
+        refreshed = _oauth_state_row(db_session, expired_state)
+        assert refreshed is not None
+        assert refreshed.used is False
+
+
+
+def test_browser_callback_expired_and_replayed_state(setup_data, db_session: Session, monkeypatch):
+    tenant = setup_data["tenant"]
+    mock_http = MockZohoHttpClient()
+    app, mock_client_factory = _setup_browser_test_app(db_session, mock_http)
+    from app.integrations.zoho import router as zoho_router
+
+    monkeypatch.setattr(zoho_router, "_get_zoho_client", mock_client_factory)
+
+    # 1. Expired state test
+    expired_state = ZohoService.create_oauth_state(db_session, tenant.id)
+    row = _oauth_state_row(db_session, expired_state)
+    assert row is not None
+    row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    db_session.commit()
+
+    with TestClient(app) as client:
+        resp_expired = client.get(
+            f"/v2/integrations/zoho/callback?code=valid_code&state={expired_state}"
+        )
+        assert resp_expired.status_code == 400
+        assert "Session Expired" in resp_expired.text
+
+    # 2. Replay state test
+    valid_state = ZohoService.create_oauth_state(db_session, tenant.id)
+    with TestClient(app) as client:
+        # First call succeeds
+        resp1 = client.get(
+            f"/v2/integrations/zoho/callback?code=valid_code&state={valid_state}"
+        )
+        assert resp1.status_code == 200
+        assert "Zoho Recruit Connected" in resp1.text
+
+        # Replay call fails
+        resp2 = client.get(
+            f"/v2/integrations/zoho/callback?code=valid_code&state={valid_state}"
+        )
+        assert resp2.status_code == 400
+        assert "Session Expired" in resp2.text
+
+
+def test_browser_callback_concurrent_claims_not_proven_on_sqlite():
+    """SQLite cannot reliably prove concurrent claims due to in-memory shared pool limitations.
+
+    Genuine multi-threaded row-locking concurrency is tested against PostgreSQL in:
+    tests/test_postgres_concurrency.py::test_postgres_concurrent_browser_get_callback_claim.
+    """
+    pytest.skip(
+        "Concurrent OAuth state claim races are not proven on SQLite; "
+        "see tests/test_postgres_concurrency.py::test_postgres_concurrent_browser_get_callback_claim."
+    )
+
+
+def test_browser_callback_data_center_binding(setup_data, db_session: Session, monkeypatch):
+    tenant = setup_data["tenant"]
+    mock_http = MockZohoHttpClient()
+    app, mock_client_factory = _setup_browser_test_app(db_session, mock_http)
+    from app.integrations.zoho import router as zoho_router
+
+    monkeypatch.setattr(zoho_router, "_get_zoho_client", mock_client_factory)
+
+    # State initiated with EU data center
+    eu_state = ZohoService.create_oauth_state(db_session, tenant.id, data_center="eu")
+    assert eu_state.startswith("eu_")
+
+    with TestClient(app) as client:
+        resp = client.get(
+            f"/v2/integrations/zoho/callback?code=valid_eu_code&state={eu_state}"
+        )
+        assert resp.status_code == 200
+        assert "Zoho Recruit Connected" in resp.text
+
+    db_session.expire_all()
+    integration = ZohoService.get_integration(db_session, tenant.id)
+    assert integration is not None
+    assert integration.data_center == "eu"
+    # Ensure token exchange hit EU endpoint
+    token_posts = [c for c in mock_http.call_history if c[0] == "POST" and "oauth/v2/token" in c[1]]
+    assert len(token_posts) == 1
+    assert "https://accounts.zoho.eu/" in token_posts[0][1]
+
+
+def test_browser_callback_token_exchange_failure(setup_data, db_session: Session, monkeypatch):
+    tenant = setup_data["tenant"]
+    mock_http = MockZohoHttpClient()
+    app, mock_client_factory = _setup_browser_test_app(db_session, mock_http)
+    from app.integrations.zoho import router as zoho_router
+
+    monkeypatch.setattr(zoho_router, "_get_zoho_client", mock_client_factory)
+
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+
+    with TestClient(app) as client:
+        # "invalid_code" triggers a 400 from MockZohoHttpClient
+        resp = client.get(
+            f"/v2/integrations/zoho/callback?code=invalid_code&state={state}"
+        )
+        assert resp.status_code == 400
+        assert "Session Expired or Invalid" in resp.text
+
+    # State must be consumed and integration NOT active
+    db_session.expire_all()
+    row = _oauth_state_row(db_session, state)
+    assert row is not None
+    assert row.used is True
+    assert ZohoService.get_integration(db_session, tenant.id) is None
+
+
+def test_api_post_callback_preserves_authentication_and_authorization(setup_data, db_session: Session, monkeypatch):
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    mock_http = MockZohoHttpClient()
+    from app.integrations.zoho import router as zoho_router
+
+    monkeypatch.setattr(
+        zoho_router,
+        "_get_zoho_client",
+        lambda data_center=None: ZohoRecruitClient(
+            client_id="cid",
+            client_secret="sec",
+            redirect_uri="https://channel-yield-analytics-agent.onrender.com/v2/integrations/zoho/callback",
+            data_center=data_center or "com",
+            http_client=mock_http,
+        ),
+    )
+
+    tenant = setup_data["tenant"]
+    viewer_token = setup_data["viewer_token"]
+    admin_token = setup_data["admin_token"]
+    state = ZohoService.create_oauth_state(db_session, tenant.id)
+
+    with TestClient(app) as client:
+        # 1. Unauthenticated POST rejected with 401
+        resp_anon = client.post(
+            "/v2/integrations/zoho/callback",
+            json={"code": "valid_code", "state": state},
+        )
+        assert resp_anon.status_code == 401
+
+        # 2. Viewer POST rejected with 403
+        resp_viewer = client.post(
+            "/v2/integrations/zoho/callback",
+            headers={"Authorization": f"Bearer {viewer_token}"},
+            json={"code": "valid_code", "state": state},
+        )
+        assert resp_viewer.status_code == 403
+
+        # 3. Admin POST succeeds and returns JSON
+        resp_admin = client.post(
+            "/v2/integrations/zoho/callback",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"code": "valid_code", "state": state},
+        )
+        assert resp_admin.status_code == 200
+        body = resp_admin.json()
+        assert body["status"] == "active"
+        assert body["is_connected"] is True
+
+
+# ─── MCP Per-User Connection Token Endpoint Tests ─────────────────────────────
+
+
+def test_mcp_token_endpoint_unauthenticated_rejected(setup_data, db_session: Session):
+    """Anonymous requests to /mcp-token must return 401."""
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    with TestClient(app) as client:
+        resp_post = client.post("/v2/integrations/zoho/mcp-token")
+        assert resp_post.status_code == 401
+
+        resp_get = client.get("/v2/integrations/zoho/mcp-token")
+        assert resp_get.status_code == 401
+
+
+def test_mcp_token_endpoint_insufficient_role_rejected(setup_data, db_session: Session):
+    """Users with 'viewer' role cannot issue MCP connection tokens (requires 'analyst' or higher)."""
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+    viewer_token = setup_data["viewer_token"]
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v2/integrations/zoho/mcp-token",
+            headers={"Authorization": f"Bearer {viewer_token}"},
+        )
+        assert resp.status_code == 403
+
+
+def test_mcp_token_endpoint_inactive_or_missing_integration_rejected(setup_data, db_session: Session):
+    """Requesting an MCP token when no active Zoho integration exists returns 400."""
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+    admin_token = setup_data["admin_token"]
+
+    with TestClient(app) as client:
+        resp = client.post(
+            "/v2/integrations/zoho/mcp-token",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body.get("error") == "integration_not_active"
+        assert "complete Zoho authorization" in body.get("message", "")
+
+
+def test_mcp_token_endpoint_successful_issuance_and_cryptographic_verification(setup_data, db_session: Session):
+    """Authorized analyst/admin with active Zoho integration receives cryptographically valid connection token."""
+    from mcp_server.server import verify_user_connection_token
+
+    tenant = setup_data["tenant"]
+    admin_token = setup_data["admin_token"]
+
+    # Create active Zoho integration for tenant
+    integration = ZohoIntegration(
+        tenant_id=tenant.id,
+        status="active",
+        data_center="eu",
+        zoho_org_id="org_test_123",
+        encrypted_access_token=encrypt_token("access_token_abc"),
+        encrypted_refresh_token=encrypt_token("refresh_token_xyz"),
+        token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    db_session.add(integration)
+    db_session.commit()
+
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    with TestClient(app) as client:
+        # POST issuance
+        resp = client.post(
+            "/v2/integrations/zoho/mcp-token",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["tenant_id"] == tenant.id
+        assert body["zoho_connected"] is True
+        assert body["zoho_data_center"] == "eu"
+        assert body["expires_in_days"] == 30
+        assert "expires_at" in body
+        token = body["connection_token"]
+        assert token.startswith("cyct_")
+        assert body["mcp_endpoint_suggestion"] == f"/sse/{token}"
+
+        # Verify cryptographic integrity of issued token
+        verified = verify_user_connection_token(token)
+        assert verified is not None
+        assert verified["tid"] == tenant.id
+        assert "sub" in verified
+        assert verified["exp"] > 0
+
+        # Tampered token verification fails
+        tampered = token[:-4] + "ffff"
+        assert verify_user_connection_token(tampered) is None
+
+        # GET request also returns valid token
+        resp_get = client.get(
+            "/v2/integrations/zoho/mcp-token",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert resp_get.status_code == 200
+        assert resp_get.json()["tenant_id"] == tenant.id
+
+
+def test_mcp_token_cross_tenant_isolation(setup_data, db_session: Session):
+    """Tokens are strictly derived from the authenticated session and cannot be spoofed across tenants."""
+    from mcp_server.server import verify_user_connection_token
+
+    tenant_a = setup_data["tenant"]
+    admin_token_a = setup_data["admin_token"]
+
+    # Active integration on Tenant A
+    db_session.add(
+        ZohoIntegration(
+            tenant_id=tenant_a.id,
+            status="active",
+            data_center="com",
+            encrypted_access_token=encrypt_token("tok_a"),
+            encrypted_refresh_token=encrypt_token("ref_a"),
+            token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+    )
+
+    # Setup Tenant B with User B
+    tenant_b = Tenant(slug="tenant-b", name="Tenant B Ltd")
+    db_session.add(tenant_b)
+    db_session.flush()
+
+    user_b = User(
+        tenant_id=tenant_b.id,
+        email="admin@tenant-b.com",
+        full_name="User B",
+        hashed_password=hash_password("b_pass"),
+    )
+    db_session.add(user_b)
+    db_session.flush()
+
+    db_session.add(Membership(tenant_id=tenant_b.id, user_id=user_b.id, role="admin"))
+    db_session.add(
+        ZohoIntegration(
+            tenant_id=tenant_b.id,
+            status="active",
+            data_center="in",
+            encrypted_access_token=encrypt_token("tok_b"),
+            encrypted_refresh_token=encrypt_token("ref_b"),
+            token_expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+    )
+    db_session.commit()
+
+    token_b_jwt = create_access_token(user_id=user_b.id, tenant_id=tenant_b.id, role="admin")
+
+    app = create_app()
+
+    def _override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_db
+
+    with TestClient(app) as client:
+        # Request from User A -> bound to Tenant A
+        resp_a = client.post(
+            "/v2/integrations/zoho/mcp-token",
+            headers={"Authorization": f"Bearer {admin_token_a}"},
+        )
+        assert resp_a.status_code == 200
+        verified_a = verify_user_connection_token(resp_a.json()["connection_token"])
+        assert verified_a["tid"] == tenant_a.id
+
+        # Request from User B -> bound to Tenant B
+        resp_b = client.post(
+            "/v2/integrations/zoho/mcp-token",
+            headers={"Authorization": f"Bearer {token_b_jwt}"},
+        )
+        assert resp_b.status_code == 200
+        verified_b = verify_user_connection_token(resp_b.json()["connection_token"])
+        assert verified_b["tid"] == tenant_b.id
+
+        # Tenant IDs are completely distinct
+        assert verified_a["tid"] != verified_b["tid"]

@@ -22,21 +22,20 @@ def parse_day(value):
     if not value: return None
     return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
 
-def compute_analytics(db_path: Path, *, client_id: str, cohort_start: str, cohort_end: str,
-                      as_of_date: str, observation_days: int, requisition_id: Optional[str] = None,
-                      min_sample_size: Optional[int] = None) -> dict:
+def compute_analytics_from_records(*, client_id: str, requisitions: list[dict], applications: list[dict],
+                                  stage_events: list[dict], costs: list[dict], cohort_start: str, cohort_end: str,
+                                  as_of_date: str, observation_days: int, requisition_id: Optional[str] = None,
+                                  min_sample_size: Optional[int] = None) -> dict:
+    """Deterministic channel yield calculations on in-memory canonical collections."""
     start, end, as_of = date.fromisoformat(cohort_start), date.fromisoformat(cohort_end), date.fromisoformat(as_of_date)
     if end < start: raise ValueError("cohort_end must be on or after cohort_start")
     if observation_days < 0: raise ValueError("observation_days must be >= 0")
     if min_sample_size is not None and min_sample_size < 1: raise ValueError("min_sample_size must be >= 1")
-    conn = sqlite3.connect(db_path)
-    try:
-        # Tenant scope is mandatory and applied to every collection read.
-        reqs = read_records(conn, client_id, "requisitions")
-        apps = read_records(conn, client_id, "applications")
-        events = read_records(conn, client_id, "stage_events")
-        costs = read_records(conn, client_id, "costs")
-    finally: conn.close()
+
+    reqs = requisitions
+    apps = applications
+    events = stage_events
+
     req_by_id = {r.get("requisition_id"): r for r in reqs}
     if requisition_id and requisition_id not in req_by_id:
         return {"status":"not_found", "client_id":client_id, "requisition_id":requisition_id,
@@ -115,6 +114,32 @@ def compute_analytics(db_path: Path, *, client_id: str, cohort_start: str, cohor
       "data_quality":{"unknown_source_applications":unknown_count,"pending_or_immature_applications_excluded":sum(x["pending_or_immature"] for x in channels),"warnings":warnings},
       "calculation_version":"yield_policy_v1"
     }
+
+def compute_analytics(db_path: Path, *, client_id: str, cohort_start: str, cohort_end: str,
+                      as_of_date: str, observation_days: int, requisition_id: Optional[str] = None,
+                      min_sample_size: Optional[int] = None) -> dict:
+    conn = sqlite3.connect(db_path)
+    try:
+        # Tenant scope is mandatory and applied to every collection read.
+        reqs = read_records(conn, client_id, "requisitions")
+        apps = read_records(conn, client_id, "applications")
+        events = read_records(conn, client_id, "stage_events")
+        costs = read_records(conn, client_id, "costs")
+    finally: conn.close()
+
+    return compute_analytics_from_records(
+        client_id=client_id,
+        requisitions=reqs,
+        applications=apps,
+        stage_events=events,
+        costs=costs,
+        cohort_start=cohort_start,
+        cohort_end=cohort_end,
+        as_of_date=as_of_date,
+        observation_days=observation_days,
+        requisition_id=requisition_id,
+        min_sample_size=min_sample_size,
+    )
 
 def self_test(folder: Path) -> dict:
     import tempfile, subprocess, sys
