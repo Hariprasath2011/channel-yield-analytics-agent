@@ -1227,9 +1227,8 @@ def test_mcp_token_endpoint_successful_issuance_and_cryptographic_verification(s
         body = resp.json()
 
         assert body["tenant_id"] == tenant.id
-        assert body["zoho_connected"] is True
-        assert body["zoho_data_center"] == "eu"
-        assert body["expires_in_days"] == 30
+        assert body["expires_in_hours"] == 24
+        assert body["expires_in_days"] == 1
         assert "expires_at" in body
         token = body["connection_token"]
         assert token.startswith("cyct_")

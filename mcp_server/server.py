@@ -5,8 +5,9 @@ Supports both:
   2. Server-Sent Events (SSE) transport: For remote HTTP agents conforming to MCP specification.
 
 Tenant Scoping:
-  The authorized organization is resolved strictly via the server-side
-  `CY_MCP_TENANT_ID` environment variable. Caller-supplied tenant IDs are rejected.
+  The authorized organization is resolved strictly from cryptographically signed,
+  customer-specific connection tokens (`cyct_...`) bound to the authenticated MCP session.
+  Caller-supplied tenant IDs cannot override verified credentials.
 """
 from __future__ import annotations
 
@@ -38,28 +39,58 @@ SERVER_NAME = "zoho-recruit-mcp"
 SERVER_VERSION = "1.0.0"
 
 
+def _is_production() -> bool:
+    env = os.getenv("CY_ENV", "").strip().lower()
+    return env in ("production", "prod")
+
+
 def _get_signing_secret() -> str:
-    """Resolve trusted server-side secret key for cryptographic token signing."""
-    return (
-        os.getenv("CY_SECRET_KEY", "").strip()
-        or os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip()
-        or os.getenv("CY_ENCRYPTION_KEY", "").strip()
-        or "channel-yield-mcp-internal-secret-fallback"
+    """Resolve trusted server-side secret key for cryptographic token signing.
+
+    In production, CY_MCP_SIGNING_SECRET or CY_SECRET_KEY is mandatory.
+    Hard-coded fallback secrets are strictly prohibited in production.
+    """
+    secret = (
+        os.getenv("CY_MCP_SIGNING_SECRET", "").strip()
+        or os.getenv("CY_SECRET_KEY", "").strip()
     )
+    if secret:
+        return secret
+
+    if _is_production():
+        raise ValueError(
+            "Production security failure: CY_MCP_SIGNING_SECRET or CY_SECRET_KEY is required. "
+            "The production MCP server refuses to sign or verify tokens with unconfigured keys."
+        )
+
+    # Non-production / test fallback ONLY
+    dev_secret = os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip() or os.getenv("CY_ENCRYPTION_KEY", "").strip()
+    return dev_secret or "dev-internal-signing-secret-not-for-production"
+
+
+MCP_TOKEN_ISSUER = "channel-yield-system"
+MCP_TOKEN_AUDIENCE = "zoho-recruit-mcp"
+DEFAULT_EXPIRY_HOURS = 24
 
 
 def create_user_connection_token(
     tenant_id: str,
     user_id: str,
     secret: Optional[str] = None,
-    expire_days: int = 30,
+    expire_hours: int = DEFAULT_EXPIRY_HOURS,
+    expire_days: Optional[int] = None,
 ) -> str:
     """Generate a tamper-proof HMAC-SHA256 connection token binding an MCP session to a user's tenant."""
     sec = secret or _get_signing_secret()
+    now = int(time.time())
+    duration_seconds = (expire_days * 86400) if expire_days is not None else (expire_hours * 3600)
     payload = {
         "tid": str(tenant_id).strip(),
         "sub": str(user_id).strip(),
-        "exp": int(time.time()) + (expire_days * 86400),
+        "iss": MCP_TOKEN_ISSUER,
+        "aud": MCP_TOKEN_AUDIENCE,
+        "iat": now,
+        "exp": now + duration_seconds,
     }
     payload_b64 = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -71,6 +102,8 @@ def create_user_connection_token(
 def verify_user_connection_token(
     token: str,
     secret: Optional[str] = None,
+    expected_audience: str = MCP_TOKEN_AUDIENCE,
+    expected_issuer: str = MCP_TOKEN_ISSUER,
 ) -> Optional[dict[str, Any]]:
     """Verify cryptographic signature and expiry of a user connection token.
 
@@ -78,7 +111,10 @@ def verify_user_connection_token(
     """
     if not token or not isinstance(token, str) or not token.startswith("cyct_") or "." not in token:
         return None
-    sec = secret or _get_signing_secret()
+    try:
+        sec = secret or _get_signing_secret()
+    except ValueError:
+        return None
     raw = token[5:]
     try:
         payload_b64, sig = raw.rsplit(".", 1)
@@ -90,6 +126,10 @@ def verify_user_connection_token(
         if payload.get("exp", 0) < time.time():
             return None
         if not payload.get("tid"):
+            return None
+        if "aud" in payload and payload["aud"] != expected_audience:
+            return None
+        if "iss" in payload and payload["iss"] != expected_issuer:
             return None
         return payload
     except Exception:
@@ -320,7 +360,44 @@ class MCPServerDispatcher:
                             "isError": True,
                         }
                     }
+                # Check for mismatch against handler's pre-bound tenant if already bound
+                if self.handler.tenant_id and verified["tid"] != self.handler.tenant_id:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json.dumps({
+                                        "status": "error",
+                                        "error": "tenant_mismatch",
+                                        "message": "Provided connection token does not match the bound session tenant."
+                                    }, indent=2)
+                                }
+                            ],
+                            "isError": True,
+                        }
+                    }
                 target_handler = ZohoRecruitMCPHandler(tenant_id=verified["tid"])
+            elif not target_handler.tenant_id:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps({
+                                    "status": "error",
+                                    "error": "unauthorized",
+                                    "message": "No tenant is bound to this request or session. Please authenticate with a valid customer connection token."
+                                }, indent=2)
+                            }
+                        ],
+                        "isError": True,
+                    }
+                }
 
             if tool_name == "check_zoho_connection":
                 result_data = target_handler.check_zoho_connection()
@@ -425,16 +502,33 @@ _ACTIVE_SESSIONS: Dict[str, asyncio.Queue] = {}
 
 
 async def health_check(_request: Request) -> JSONResponse:
-    """Readiness probe returning service status without exposing credentials or tenant details."""
-    tenant_configured = bool(os.getenv("CY_MCP_TENANT_ID"))
-    auth_configured = bool(os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip()) or bool(os.getenv("CY_MCP_AUTH_TOKEN", "").strip())
+    """Liveness probe returning service status without exposing credentials or tenant details."""
     return JSONResponse({
         "status": "ok",
         "service": SERVER_NAME,
         "version": SERVER_VERSION,
-        "tenant_configured": tenant_configured,
-        "auth_configured": auth_configured,
     })
+
+
+async def ready_check(_request: Request) -> JSONResponse:
+    """Readiness probe checking production configuration and cryptographic signing readiness."""
+    is_prod = _is_production()
+    has_signing_secret = bool(os.getenv("CY_MCP_SIGNING_SECRET", "").strip() or os.getenv("CY_SECRET_KEY", "").strip())
+    has_path_key = bool(os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip())
+    has_auth_token = bool(os.getenv("CY_MCP_AUTH_TOKEN", "").strip())
+
+    is_ready = True
+    if is_prod and not (has_signing_secret or has_path_key or has_auth_token):
+        is_ready = False
+
+    status_code = 200 if is_ready else 503
+    return JSONResponse({
+        "status": "ready" if is_ready else "not_ready",
+        "service": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "multi_tenant_ready": has_signing_secret,
+        "auth_configured": has_signing_secret or has_path_key or has_auth_token,
+    }, status_code=status_code)
 
 
 def _get_session_queue(session_id: str) -> Optional[asyncio.Queue]:
@@ -454,11 +548,17 @@ def _get_session_tenant_id(session_id: str) -> Optional[str]:
 
 
 def _verify_path_key(secret_key: str) -> bool:
-    """Verify high-entropy secret path key using constant-time comparison or signed user token."""
-    expected_key = os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip()
-    if expected_key and secret_key and hmac.compare_digest(secret_key, expected_key):
+    """Verify secret path key: either customer connection token or static path secret."""
+    if not secret_key:
+        return False
+    # 1. Customer-specific connection token
+    if verify_user_connection_token(secret_key) is not None:
         return True
-    return verify_user_connection_token(secret_key) is not None
+    # 2. Static path secret (for operational health/admin if configured)
+    expected_key = os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip()
+    if expected_key and hmac.compare_digest(secret_key, expected_key):
+        return True
+    return False
 
 
 def _verify_bearer_token(request: Request) -> bool:
@@ -479,11 +579,16 @@ def _verify_bearer_token(request: Request) -> bool:
     return False
 
 
-def _create_sse_response(endpoint_data: str, tenant_id: Optional[str] = None) -> StreamingResponse:
-    """Establish SSE session and stream MCP events to client with optional bound tenant context."""
+def _create_sse_response(endpoint_data: str, tenant_id: Optional[str] = None, user_id: Optional[str] = None) -> StreamingResponse:
+    """Establish SSE session and stream MCP events to client with bound tenant context."""
     session_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue()
-    _ACTIVE_SESSIONS[session_id] = {"queue": queue, "tenant_id": tenant_id}
+    _ACTIVE_SESSIONS[session_id] = {
+        "queue": queue,
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "created_at": time.time(),
+    }
 
     async def event_generator() -> AsyncGenerator[bytes, None]:
         # Initial MCP endpoint event
@@ -531,7 +636,8 @@ async def sse_capability_endpoint(request: Request) -> Response:
         )
     verified = verify_user_connection_token(secret_key)
     tenant_id = verified["tid"] if verified else None
-    return _create_sse_response(endpoint_data=f"/messages/{secret_key}", tenant_id=tenant_id)
+    user_id = verified.get("sub") if verified else None
+    return _create_sse_response(endpoint_data=f"/messages/{secret_key}", tenant_id=tenant_id, user_id=user_id)
 
 
 async def _dispatch_incoming_message(request: Request) -> JSONResponse:
@@ -545,21 +651,67 @@ async def _dispatch_incoming_message(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    session_tenant_id = _get_session_tenant_id(session_id) if session_id else None
+    is_tool_call = isinstance(body, dict) and body.get("method") == "tools/call"
+
+    # Validate session_id if provided
+    if session_id:
+        session_entry = _ACTIVE_SESSIONS.get(session_id)
+        if not session_entry or not isinstance(session_entry, dict):
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": body.get("id") if isinstance(body, dict) else None,
+                 "error": {"code": -32002, "message": "Session not found or expired."}},
+                status_code=404,
+            )
+        session_tenant_id = session_entry.get("tenant_id")
+    else:
+        session_entry = None
+        session_tenant_id = None
+
+    # Check capability path parameter token if present
+    url_secret_key = request.path_params.get("secret_key", "").strip()
+    if url_secret_key and url_secret_key.startswith("cyct_"):
+        verified_token = verify_user_connection_token(url_secret_key)
+        if not verified_token:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": body.get("id") if isinstance(body, dict) else None,
+                 "error": {"code": -32004, "message": "Invalid or expired connection token in message path."}},
+                status_code=401,
+            )
+        token_tenant_id = verified_token["tid"]
+        if session_tenant_id and session_tenant_id != token_tenant_id:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": body.get("id") if isinstance(body, dict) else None,
+                 "error": {"code": -32005, "message": "Session tenant does not match credential tenant."}},
+                status_code=403,
+            )
+        if not session_tenant_id:
+            session_tenant_id = token_tenant_id
+
+    # For tool executions, require an authenticated tenant bound to session, token, or argument
+    if is_tool_call:
+        tool_args = body.get("params", {}).get("arguments", {}) if isinstance(body, dict) else {}
+        has_arg_token = bool(tool_args.get("connection_token"))
+        if not session_tenant_id and not has_arg_token:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": body.get("id"),
+                 "error": {"code": -32003, "message": "Authentication required: no authorized tenant bound to this session."}},
+                status_code=401,
+            )
+
     if session_tenant_id:
         dispatcher = MCPServerDispatcher(handler=ZohoRecruitMCPHandler(tenant_id=session_tenant_id))
     else:
-        dispatcher = getattr(request.app.state, "dispatcher", None) or MCPServerDispatcher()
+        dispatcher = MCPServerDispatcher(handler=ZohoRecruitMCPHandler(tenant_id=None))
 
     response_payload = dispatcher.dispatch(body)
 
-    sess_queue = _get_session_queue(session_id) if session_id else None
+    sess_queue = session_entry.get("queue") if session_entry else None
     if sess_queue is not None:
         if response_payload is not None:
             await sess_queue.put(response_payload)
         return JSONResponse({"status": "accepted"}, status_code=202)
 
-    # Direct JSON response fallback if no active SSE session
+    # Direct JSON response fallback if no active SSE session queue
     if response_payload is not None:
         return JSONResponse(response_payload)
     return JSONResponse({"status": "accepted"}, status_code=202)
@@ -589,22 +741,23 @@ async def messages_capability_endpoint(request: Request) -> JSONResponse:
 def create_mcp_app(dispatcher: Optional[MCPServerDispatcher] = None) -> Starlette:
     """Factory creating the ASGI application for the MCP service.
 
-    Fails closed in production if neither CY_MCP_SECRET_PATH_KEY nor CY_MCP_AUTH_TOKEN
-    is configured.
+    Fails closed in production if neither signing secret, capability path key,
+    nor bearer auth token is configured.
     """
-    is_prod = os.getenv("CY_ENV", "").strip().lower() == "production"
+    is_prod = _is_production()
+    has_signing_secret = bool(os.getenv("CY_MCP_SIGNING_SECRET", "").strip() or os.getenv("CY_SECRET_KEY", "").strip())
     has_path_key = bool(os.getenv("CY_MCP_SECRET_PATH_KEY", "").strip())
     has_auth_token = bool(os.getenv("CY_MCP_AUTH_TOKEN", "").strip())
 
-    if is_prod and not (has_path_key or has_auth_token):
+    if is_prod and not (has_signing_secret or has_path_key or has_auth_token):
         raise ValueError(
             "Production MCP server refuses to start without an authentication mechanism configured. "
-            "Set CY_MCP_SECRET_PATH_KEY or CY_MCP_AUTH_TOKEN."
+            "Set CY_MCP_SIGNING_SECRET, CY_SECRET_KEY, CY_MCP_SECRET_PATH_KEY, or CY_MCP_AUTH_TOKEN."
         )
 
     routes = [
         Route("/health", health_check, methods=["GET"]),
-        Route("/ready", health_check, methods=["GET"]),
+        Route("/ready", ready_check, methods=["GET"]),
         Route("/sse", sse_endpoint, methods=["GET"]),
         Route("/sse/{secret_key}", sse_capability_endpoint, methods=["GET"]),
         Route("/messages", messages_endpoint, methods=["POST"]),

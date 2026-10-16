@@ -1,17 +1,47 @@
-# Separate Render Blueprint for Zoho Recruit Demo MCP Server
-# Completely isolated demo service returning fictional recruitment data for iGentic connectivity testing.
-# Requires NO database, Zoho OAuth credentials, encryption keys, or secrets.
+# Render Blueprint for Zoho Recruit MCP Server
+# Configured for the existing Render service: zoho-recruit-mcp-demo (Free plan)
+# Upgraded from dummy demo to the REAL production-ready Zoho Recruit MCP server.
+#
+# RECOVERY NOTE:
+# The original dummy demo blueprint is preserved in mcp_demo/render-mcp-demo.original.yaml.
 
 services:
   - type: web
     name: zoho-recruit-mcp-demo
     runtime: python
-    buildCommand: pip install -r requirements-mcp-demo.txt
-    startCommand: python -m mcp_demo.server
     plan: free
     region: oregon
+    buildCommand: "pip install -r requirements-mcp.txt"
+    startCommand: "python -m mcp_server.server --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
     envVars:
-      - key: PORT
-        value: 10000
+      - key: CY_ENV
+        value: production
+      - key: CY_MCP_HOST
+        value: 0.0.0.0
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: CY_DATABASE_URL
+        sync: false
+        # Database connection URI (postgresql+psycopg2://...) to access encrypted tenant integration credentials
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+        # Fernet encryption key used to decrypt Zoho OAuth tokens at rest
+      - key: CY_MCP_SIGNING_SECRET
+        sync: false
+        # Dedicated high-entropy secret for signing and verifying per-user customer MCP connection tokens
+      - key: CY_SECRET_KEY
+        sync: false
+        # Shared application secret key (fallback signing secret matching main web application)
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+        # Zoho Recruit OAuth 2.0 Client ID for token refresh
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+        # Zoho Recruit OAuth 2.0 Client Secret for token refresh
+      - key: CY_ZOHO_REDIRECT_URI
+        sync: false
+        # Registered OAuth 2.0 redirect URI pointing to main application callback
+      - key: CY_MCP_SECRET_PATH_KEY
+        sync: false
+        # Optional static secret key for operational health/monitoring paths

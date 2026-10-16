@@ -71,53 +71,50 @@ python -m mcp_server.server --host 0.0.0.0 --port 8001
 
 ## 4. Tenant Isolation & Access Control
 
-- **Server-Side Tenant Resolution**: The authorized organization is defined exclusively by the `CY_MCP_TENANT_ID` server environment variable. The server queries the database for that tenant's active integration. **Caller-supplied tenant identifiers are never accepted as proof of authorization.**
-- **Dual Authentication Mechanisms**:
-  1. **Capability-Path Key (`CY_MCP_SECRET_PATH_KEY`)**:
-     Designed for clients such as iGentic that cannot inject custom HTTP headers.
-     - Endpoints: `GET /sse/{secret_key}` and `POST /messages/{secret_key}?session_id=<uuid>`
-     - Constant-time secret comparison using `hmac.compare_digest`.
-     - Standard unauthenticated routes (`/sse`, `/messages`) reject unauthorized callers with `HTTP 401 Unauthorized`.
-  2. **Bearer Token Guard (`CY_MCP_AUTH_TOKEN`)**:
+- **Cryptographic Tenant Resolution**: The authorized organization is derived from a customer-specific, cryptographically signed connection credential (`cyct_...`) issued by `POST /v2/integrations/zoho/mcp-token`. The server validates HMAC-SHA256 signatures and claims (`tid`, `sub`, `exp`, `iss`, `aud`) on every connection and message. **Caller-supplied tenant identifiers cannot override verified credentials.**
+- **Legacy Dev-Mode Fallback**: `CY_MCP_TENANT_ID` is disabled in production (`CY_ENV=production`) and is only permitted for single-tenant local debugging when `CY_MCP_DEV_MODE=true`.
+- **Authentication Mechanisms**:
+  1. **Customer Connection Token (`/sse/{connection_token}`)**:
+     Standard customer flow for clients like iGentic that connect using an SSE URL.
+     - Endpoints: `GET /sse/{connection_token}` and `POST /messages/{connection_token}?session_id=<uuid>`
+     - Bound to the customer's verified tenant ID and authenticated user.
+     - Cross-session tenant mismatch is rejected with HTTP 403.
+     - Unauthenticated tool executions are rejected with HTTP 401.
+  2. **Operational Capability-Path Key (`CY_MCP_SECRET_PATH_KEY`)**:
+     Optional static path key reserved for operational health checks or administrative access.
+  3. **Bearer Token Guard (`CY_MCP_AUTH_TOKEN`)**:
      For clients supporting standard headers (`Authorization: Bearer <token>` or `X-MCP-Token: <token>`).
 - **Production Fail-Closed Guarantee**:
-  In production (`CY_ENV=production`), application startup fails immediately (`ValueError`) if neither `CY_MCP_SECRET_PATH_KEY` nor `CY_MCP_AUTH_TOKEN` is configured. Unauthenticated public exposure is strictly prevented.
+  In production (`CY_ENV=production`), application startup fails immediately (`ValueError`) if no signing secret (`CY_MCP_SIGNING_SECRET` / `CY_SECRET_KEY`) or authentication mechanism is configured. Unauthenticated public exposure is strictly prevented.
 
 ---
 
 ## 5. iGentic Connection & Render Deployment
 
-### 5.1 iGentic Connection via Capability URL
-Because the iGentic tool configuration UI accepts a Server URL but does not provide custom HTTP authorization headers, iGentic connects using the capability URL path.
+### 5.1 iGentic Customer Connection via Signed Connection Token
+In iGentic, each customer connects to their own isolated Zoho Recruit data using a signed connection token:
 
-1. **Generate a High-Entropy Secret Key**:
-   Generate a cryptographic secret (at least 32 bytes / 43 base64 characters):
-   ```bash
-   python -c "import secrets; print(secrets.token_urlsafe(32))"
-   ```
-2. **Configure Render Environment**:
-   Set `CY_MCP_SECRET_PATH_KEY` to this generated secret value in the Render service settings.
-3. **Configure iGentic**:
-   In the iGentic MCP configuration screen:
-   - **Server URL**: `https://<render-service-name>.onrender.com/sse/<secret-path-key>`
+1. Customer signs into the Channel Yield web application.
+2. Customer connects their Zoho Recruit account via OAuth 2.0.
+3. Customer navigates to Integrations -> Zoho Recruit -> Get MCP Connection Token (`POST /v2/integrations/zoho/mcp-token`).
+4. In iGentic MCP configuration:
+   - **Server URL**: `https://<render-service-name>.onrender.com/sse/<connection-token>`
    - **Transport**: `sse`
    - **Headers**: None required.
 
 ### 5.2 Infrastructure Security & URL Path Protection
 > [!WARNING]
 > **URL Path Credentials Notice**:
-> Capability keys embedded in URL paths can be captured in intermediary web proxies, CDN access logs, and browser histories.
-> - Configure reverse-proxy / CDN access logging to redact the path key or truncate URI paths for `/sse/*` and `/messages/*`.
-> - Never print or log the capability URL or path key in application logging.
-> - Rotate `CY_MCP_SECRET_PATH_KEY` periodically or immediately if an unauthorized party obtains the URL.
+> Connection tokens in URL paths should be treated as sensitive credentials:
+> - Configure reverse-proxy / CDN access logging to redact the path token for `/sse/*` and `/messages/*`.
+> - Never print or log the connection token in application logging.
+> - Default token lifetime is 24 hours (configurable up to 7 days).
 
-### 5.3 Service Separation Architecture
-To prevent credential mixing and accidental disruption, three isolated Render Blueprints are maintained:
-1. `render.yaml`: Main Channel Yield multi-tenant analytics service.
-2. `render-mcp-demo.yaml`: Standalone dummy-data MCP demo service (`zoho-recruit-mcp-demo`) requiring zero secrets.
-3. `render-mcp.yaml`: Real Zoho Recruit MCP server (`zoho-recruit-mcp`) requiring database connection and capability key.
-
-When approved, deploy the real MCP service independently:
-```bash
-render blueprint launch render-mcp.yaml
-```
+### 5.3 Service Deployment on Render Free Tier
+To run the real multi-tenant MCP server on Render's free tier without creating a second paid service:
+1. The existing service `zoho-recruit-mcp-demo` is updated via `render-mcp-demo.yaml` with:
+   - Build Command: `pip install -r requirements-mcp.txt`
+   - Start Command: `python -m mcp_server.server --host 0.0.0.0 --port $PORT`
+   - Health Check: `/health`
+   - Plan: `free`
+2. Rollback to the fictional dummy demo is preserved in `mcp_demo/render-mcp-demo.original.yaml`.

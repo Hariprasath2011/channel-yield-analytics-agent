@@ -50,10 +50,22 @@ class ZohoRecruitMCPHandler:
     def __init__(self, tenant_id: Optional[str] = None) -> None:
         """Initialize handler with trusted server-side tenant configuration.
 
-        If tenant_id is not passed explicitly, it is read from the CY_MCP_TENANT_ID
-        environment variable. It is NEVER taken from caller/agent inputs.
+        In production, tenant_id MUST be explicitly passed from the verified credential or session.
+        CY_MCP_TENANT_ID is ONLY permitted in development mode (CY_ENV != 'production' and CY_MCP_DEV_MODE == 'true').
+        It is NEVER taken from arbitrary caller inputs or used as an implicit fallback in production.
         """
-        self._tenant_id = (tenant_id or os.getenv("CY_MCP_TENANT_ID", "")).strip()
+        if tenant_id:
+            self._tenant_id = str(tenant_id).strip()
+        else:
+            is_prod = os.getenv("CY_ENV", "").strip().lower() in ("production", "prod")
+            allow_dev_fallback = (
+                not is_prod
+                and os.getenv("CY_MCP_DEV_MODE", "").strip().lower() in ("true", "1", "yes")
+            )
+            if allow_dev_fallback:
+                self._tenant_id = os.getenv("CY_MCP_TENANT_ID", "").strip()
+            else:
+                self._tenant_id = ""
 
     @property
     def tenant_id(self) -> str:
@@ -65,8 +77,7 @@ class ZohoRecruitMCPHandler:
         """Resolve tenant integration, check token expiry, refresh if needed, and return client."""
         if not self._tenant_id:
             raise ValidationError(
-                "MCP server has no configured tenant ID. "
-                "Set the CY_MCP_TENANT_ID environment variable on the server."
+                "There is no configured tenant ID bound to this MCP request. Please authenticate with a valid customer connection token."
             )
 
         integration = ZohoService.get_integration(db, self._tenant_id)

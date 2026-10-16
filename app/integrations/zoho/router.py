@@ -164,7 +164,8 @@ class IntegrationStatusResponse(BaseModel):
 class MCPConnectionTokenResponse(BaseModel):
     connection_token: str = Field(..., description="Cryptographically signed HMAC-SHA256 connection token")
     token_type: str = Field("Bearer", description="Token authorization type")
-    expires_in_days: int = Field(30, description="Token validity window in days")
+    expires_in_hours: int = Field(24, description="Token validity window in hours")
+    expires_in_days: int = Field(1, description="Token validity window in days")
     expires_at: str = Field(..., description="ISO 8601 UTC timestamp when token expires")
     tenant_id: str = Field(..., description="Authorized tenant identifier")
     zoho_connected: bool = Field(True, description="Whether Zoho integration is active")
@@ -251,6 +252,7 @@ def get_status(
     response_model=MCPConnectionTokenResponse,
 )
 def issue_mcp_connection_token(
+    expire_hours: int = Query(24, ge=1, le=168, description="Token validity in hours (default 24h, max 168h / 7 days)"),
     ctx: AuthenticatedContext = Depends(require_role("analyst")),
     db: Session = Depends(get_db),
 ) -> MCPConnectionTokenResponse:
@@ -260,7 +262,7 @@ def issue_mcp_connection_token(
       - Derives tenant and user strictly from authenticated session (JWT or API key).
       - Caller-supplied user_id or tenant_id parameters are rejected (not accepted).
       - Verifies active Zoho integration before issuing.
-      - Signs payload with server secret using HMAC-SHA256 (30-day expiry).
+      - Signs payload with server secret using HMAC-SHA256 (configurable short-lived expiry, default 24h).
       - Never returns OAuth tokens, client secrets, or database credentials.
     """
     integration = ZohoService.get_integration(db, ctx.tenant_id)
@@ -276,18 +278,18 @@ def issue_mcp_connection_token(
             },
         )
 
-    expires_in_days = 30
     token = create_user_connection_token(
         tenant_id=ctx.tenant_id,
         user_id=ctx.user_id,
-        expire_days=expires_in_days,
+        expire_hours=expire_hours,
     )
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=expires_in_days)).isoformat()
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=expire_hours)).isoformat()
 
     return MCPConnectionTokenResponse(
         connection_token=token,
         token_type="Bearer",
-        expires_in_days=expires_in_days,
+        expires_in_hours=expire_hours,
+        expires_in_days=max(1, expire_hours // 24),
         expires_at=expires_at,
         tenant_id=ctx.tenant_id,
         zoho_connected=True,

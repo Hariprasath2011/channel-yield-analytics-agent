@@ -603,7 +603,7 @@ def test_end_to_end_sse_message_delivery_for_real_tool(mcp_tenant, monkeypatch):
     async def _run():
         session_id = str(uuid.uuid4())
         session_queue: asyncio.Queue = asyncio.Queue()
-        _ACTIVE_SESSIONS[session_id] = session_queue
+        _ACTIVE_SESSIONS[session_id] = {"queue": session_queue, "tenant_id": mcp_tenant.id}
 
         try:
             # Mock Zoho client records
@@ -790,3 +790,102 @@ def test_tampered_or_invalid_connection_token_rejected():
         content = json.loads(resp["result"]["content"][0]["text"])
         assert content["error"] == "unauthorized"
         assert "Invalid, expired, or tampered" in content["message"]
+
+
+def test_ready_endpoint_probe(monkeypatch):
+    """Verify /ready probe reports multi-tenant readiness when signing keys are set."""
+    monkeypatch.setenv("CY_MCP_SIGNING_SECRET", "test-signing-secret-12345")
+    app = create_mcp_app()
+    with TestClient(app) as client:
+        resp = client.get("/ready")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ready"
+        assert body["multi_tenant_ready"] is True
+        assert body["auth_configured"] is True
+
+
+def test_messages_unknown_session_id_returns_404(monkeypatch):
+    """POSTing messages with an unknown session_id returns 404."""
+    monkeypatch.setenv("CY_MCP_SECRET_PATH_KEY", "valid-key-123")
+    app = create_mcp_app()
+    with TestClient(app) as client:
+        resp = client.post(
+            "/messages/valid-key-123?session_id=nonexistent-session-uuid",
+            json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        )
+        assert resp.status_code == 404
+        assert "Session not found" in resp.json()["error"]["message"]
+
+
+def test_session_tenant_mismatch_rejected(monkeypatch):
+    """POSTing to /messages/{token_B} with a session bound to Tenant A returns 403."""
+    from mcp_server.server import _ACTIVE_SESSIONS
+
+    token_b = create_user_connection_token(tenant_id="tenant-b", user_id="user-b")
+    app = create_mcp_app()
+
+    session_id = "session-bound-to-tenant-a"
+    _ACTIVE_SESSIONS[session_id] = {
+        "queue": asyncio.Queue(),
+        "tenant_id": "tenant-a",
+        "user_id": "user-a",
+        "created_at": 1000.0,
+    }
+    try:
+        with TestClient(app) as client:
+            resp = client.post(
+                f"/messages/{token_b}?session_id={session_id}",
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            )
+            assert resp.status_code == 403
+            assert "Session tenant does not match" in resp.json()["error"]["message"]
+    finally:
+        _ACTIVE_SESSIONS.pop(session_id, None)
+
+
+def test_token_with_wrong_audience_or_issuer_rejected():
+    """Tokens signed with unexpected audience or issuer must be rejected."""
+    import base64
+    import hashlib
+    import hmac
+    import time
+
+    sec = "test-custom-secret"
+    # Token with wrong audience
+    payload_bad_aud = {
+        "tid": "tenant-xyz",
+        "sub": "user-1",
+        "iss": "channel-yield-system",
+        "aud": "wrong-audience-server",
+        "exp": int(time.time()) + 3600,
+    }
+    b64 = base64.urlsafe_b64encode(json.dumps(payload_bad_aud).encode("utf-8")).decode("utf-8").rstrip("=")
+    sig = hmac.new(sec.encode("utf-8"), b64.encode("utf-8"), hashlib.sha256).hexdigest()
+    bad_token = f"cyct_{b64}.{sig}"
+    assert verify_user_connection_token(bad_token, secret=sec) is None
+
+
+def test_production_signing_secret_missing_fails_closed(monkeypatch):
+    """In production mode, missing signing keys must fail closed and raise ValueError."""
+    from mcp_server.server import _get_signing_secret
+
+    monkeypatch.setenv("CY_ENV", "production")
+    monkeypatch.delenv("CY_MCP_SIGNING_SECRET", raising=False)
+    monkeypatch.delenv("CY_SECRET_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="Production security failure"):
+        _get_signing_secret()
+
+
+def test_production_no_implicit_fallback_to_fixed_tenant(monkeypatch):
+    """In production mode, ZohoRecruitMCPHandler refuses to fall back to CY_MCP_TENANT_ID."""
+    monkeypatch.setenv("CY_ENV", "production")
+    monkeypatch.setenv("CY_MCP_TENANT_ID", "unauthorized-fallback-tenant")
+
+    handler = ZohoRecruitMCPHandler()  # No tenant_id passed
+    assert handler.tenant_id == ""  # Did NOT adopt CY_MCP_TENANT_ID
+
+    res = handler.check_zoho_connection()
+    assert res["connected"] is False
+    assert res["status"] == "unconfigured"

@@ -1,0 +1,19 @@
+# Original Render Blueprint for Zoho Recruit Dummy Demo MCP Server
+# Preserved for immediate rollback/recovery if dummy fictional demo is ever needed again.
+#
+# To restore the dummy demo on Render:
+# Copy this file over render-mcp-demo.yaml and deploy.
+
+services:
+  - type: web
+    name: zoho-recruit-mcp-demo
+    runtime: python
+    buildCommand: pip install -r requirements-mcp-demo.txt
+    startCommand: python -m mcp_demo.server
+    plan: free
+    region: oregon
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PYTHONUNBUFFERED
+        value: "1"
