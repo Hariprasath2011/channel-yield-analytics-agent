@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 import uuid
@@ -26,6 +27,7 @@ from mcp_server.server import (
 from mcp_server.zoho_recruit import (
     ALLOWED_MODULES,
     ZohoRecruitMCPHandler,
+    _safe_db_error_metadata,
 )
 
 
@@ -1062,3 +1064,81 @@ def test_reusing_pending_oauth_state_avoids_competing_states(db_session):
 
     # Exactly the same URL / state token is reused
     assert url1 == url2
+
+
+def test_safe_db_error_metadata_sanitization():
+    """Verify _safe_db_error_metadata extracts only safe metadata and normalizes SQLSTATEs."""
+    class MockDriverError(Exception):
+        pgcode = "  42p01  "  # Lowercase with surrounding whitespace to verify trimming and uppercase normalization
+
+    sensitive_exc = Exception("password=super_secret_123 host=internal-db.render.com SELECT * FROM secret_table")
+    sensitive_exc.orig = MockDriverError("FATAL: password=super_secret_123 authentication failed")
+
+    meta = _safe_db_error_metadata(sensitive_exc, stage="primary_tenant_resolution")
+    assert meta["error"] == "Exception"
+    assert meta["driver"] == "MockDriverError"
+    assert meta["sqlstate"] == "42P01"  # Trimmed and uppercase
+    assert meta["stage"] == "primary_tenant_resolution"
+
+    # Confirm sensitive strings are completely absent
+    dumped = json.dumps(meta)
+    assert "super_secret_123" not in dumped
+    assert "internal-db" not in dumped
+    assert "secret_table" not in dumped
+
+    # Simulate malformed SQLSTATE (e.g., driver text or SQL injection) — must normalize to None
+    malformed_driver = Exception("driver error text")
+    malformed_driver.pgcode = "42P01; DROP TABLE users; --"
+    sensitive_exc.orig = malformed_driver
+
+    meta_malformed = _safe_db_error_metadata(sensitive_exc)
+    assert meta_malformed["sqlstate"] is None
+    assert meta_malformed["stage"] == "unknown"
+
+
+def test_check_zoho_connection_error_logging_redacts_credentials(monkeypatch):
+    """Verify check_zoho_connection logs safe metadata and never leaks connection strings."""
+    import mcp_server.zoho_recruit as zr_mod
+
+    class SimulatedOperationalError(Exception):
+        pass
+
+    class SimulatedDriverError(Exception):
+        pgcode = "08006"
+
+    secret_msg = "connection to postgresql://user:SuperSecretPassword123!@db-host.internal:5432/proddb failed"
+    simulated_exc = SimulatedOperationalError(secret_msg)
+    simulated_exc.orig = SimulatedDriverError("FATAL: authentication failed for user 'user'")
+
+    @contextlib.contextmanager
+    def mock_failing_db_context():
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.side_effect = simulated_exc
+        yield mock_db
+
+    monkeypatch.setattr(zr_mod, "get_db_context", mock_failing_db_context)
+
+    with patch.object(zr_mod.logger, "error") as mock_logger_error:
+        handler = zr_mod.ZohoRecruitMCPHandler()
+        res = handler.check_zoho_connection()
+
+    # 1. User-facing response remains identical
+    assert res == {"error": "database_error", "message": "Failed to check integration status."}
+
+    # 2. Logger called with sanitized kwargs
+    mock_logger_error.assert_called_once_with(
+        "mcp.check_connection_error",
+        error="SimulatedOperationalError",
+        driver="SimulatedDriverError",
+        sqlstate="08006",
+        stage="primary_tenant_resolution",
+    )
+
+    # 3. Verify sensitive fragments are absent from all logged arguments and keyword values
+    logged_str = " ".join(str(arg) for arg in mock_logger_error.call_args[0]) + " " + " ".join(f"{k}={v}" for k, v in mock_logger_error.call_args[1].items())
+    assert "SuperSecretPassword123!" not in logged_str
+    assert "db-host.internal" not in logged_str
+    assert "postgresql://" not in logged_str
+    assert "proddb" not in logged_str
+    assert "FATAL" not in logged_str
+

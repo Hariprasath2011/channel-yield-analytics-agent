@@ -11,6 +11,7 @@ the existing ZohoRecruitClient while enforcing:
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -39,6 +40,26 @@ logger = get_logger(__name__)
 # Strict allowlist of Zoho Recruit API modules permitted for read operations
 ALLOWED_MODULES = frozenset({"JobOpenings", "Candidates", "Applications"})
 
+_SQLSTATE_REGEX = re.compile(r"^[A-Za-z0-9]{5}$")
+
+
+def _safe_db_error_metadata(exc: Exception, *, stage: str = "unknown") -> dict[str, Any]:
+    """Extract strictly sanitised metadata from a database exception.
+
+    Guarantees that raw exception messages, driver strings, SQL statements,
+    tracebacks, connection parameters, and credentials are never logged.
+    """
+    orig = getattr(exc, "orig", None)
+    raw_code = getattr(orig, "pgcode", None)
+    candidate = raw_code.strip().upper() if isinstance(raw_code, str) else None
+    valid_code = candidate if candidate and _SQLSTATE_REGEX.fullmatch(candidate) else None
+    return {
+        "error": type(exc).__name__,
+        "driver": type(orig).__name__ if orig is not None else None,
+        "sqlstate": valid_code,
+        "stage": stage,
+    }
+
 # Bounded pagination defaults and limits
 DEFAULT_PER_PAGE = 20
 MAX_PER_PAGE = 100
@@ -61,7 +82,10 @@ def get_primary_active_integration() -> Optional[ZohoIntegration]:
             if integration and integration.tenant_id:
                 return integration
     except Exception as exc:
-        logger.error("mcp.resolve_primary_integration_failed", error=type(exc).__name__)
+        logger.error(
+            "mcp.resolve_primary_integration_failed",
+            **_safe_db_error_metadata(exc, stage="primary_integration_lookup"),
+        )
     return None
 
 
@@ -417,13 +441,16 @@ class ZohoRecruitMCPHandler:
 
     def check_zoho_connection(self, data_center: Optional[str] = None) -> dict[str, Any]:
         """Verify whether this user's organization has an active Zoho Recruit connection."""
+        stage = "session_scope"
         try:
             with get_db_context() as db:
                 target_tenant_id = self._tenant_id
                 if not target_tenant_id:
+                    stage = "primary_tenant_resolution"
                     primary_tenant = get_or_create_primary_tenant(db)
                     target_tenant_id = primary_tenant.id
 
+                stage = "integration_lookup"
                 integration = ZohoService.get_integration(db, target_tenant_id)
                 if integration and integration.status == "active":
                     return {
@@ -435,6 +462,7 @@ class ZohoRecruitMCPHandler:
                         "last_sync_at": integration.last_sync_at.isoformat() if integration.last_sync_at else None,
                     }
 
+                stage = "auth_url_generation"
                 auth_url = self._get_or_create_auth_url(db, target_tenant_id, data_center=data_center)
                 status_label = "unconfigured" if not self._tenant_id else (integration.status if integration else "pending_auth")
                 return {
@@ -451,7 +479,10 @@ class ZohoRecruitMCPHandler:
                     "instructions": "Click the authorization URL to sign in to Zoho Recruit and grant access.",
                 }
         except Exception as exc:
-            logger.error("mcp.check_connection_error", error=type(exc).__name__)
+            logger.error(
+                "mcp.check_connection_error",
+                **_safe_db_error_metadata(exc, stage=stage),
+            )
             return {"error": "database_error", "message": "Failed to check integration status."}
 
     def connect_zoho_account(self, data_center: str = "in") -> dict[str, Any]:
