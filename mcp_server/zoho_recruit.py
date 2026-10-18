@@ -82,9 +82,10 @@ def get_primary_active_integration() -> Optional[ZohoIntegration]:
             if integration and integration.tenant_id:
                 return integration
     except Exception as exc:
+        meta = _safe_db_error_metadata(exc, stage="primary_integration_lookup")
         logger.error(
-            "mcp.resolve_primary_integration_failed",
-            **_safe_db_error_metadata(exc, stage="primary_integration_lookup"),
+            f"mcp.resolve_primary_integration_failed (error={meta['error']} driver={meta['driver']} sqlstate={meta['sqlstate']} stage={meta['stage']})",
+            **meta,
         )
     return None
 
@@ -479,9 +480,10 @@ class ZohoRecruitMCPHandler:
                     "instructions": "Click the authorization URL to sign in to Zoho Recruit and grant access.",
                 }
         except Exception as exc:
+            meta = _safe_db_error_metadata(exc, stage=stage)
             logger.error(
-                "mcp.check_connection_error",
-                **_safe_db_error_metadata(exc, stage=stage),
+                f"mcp.check_connection_error (error={meta['error']} driver={meta['driver']} sqlstate={meta['sqlstate']} stage={meta['stage']})",
+                **meta,
             )
             return {"error": "database_error", "message": "Failed to check integration status."}
 

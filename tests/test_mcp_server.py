@@ -1125,20 +1125,153 @@ def test_check_zoho_connection_error_logging_redacts_credentials(monkeypatch):
     # 1. User-facing response remains identical
     assert res == {"error": "database_error", "message": "Failed to check integration status."}
 
-    # 2. Logger called with sanitized kwargs
+    # 2. Logger called with visible message and sanitized kwargs
+    expected_msg = (
+        "mcp.check_connection_error "
+        "(error=SimulatedOperationalError driver=SimulatedDriverError sqlstate=08006 stage=primary_tenant_resolution)"
+    )
     mock_logger_error.assert_called_once_with(
-        "mcp.check_connection_error",
+        expected_msg,
         error="SimulatedOperationalError",
         driver="SimulatedDriverError",
         sqlstate="08006",
         stage="primary_tenant_resolution",
     )
 
-    # 3. Verify sensitive fragments are absent from all logged arguments and keyword values
+    # 3. Verify visible message explicitly includes sanitized metadata
+    visible_msg = mock_logger_error.call_args[0][0]
+    assert "error=SimulatedOperationalError" in visible_msg
+    assert "driver=SimulatedDriverError" in visible_msg
+    assert "sqlstate=08006" in visible_msg
+    assert "stage=primary_tenant_resolution" in visible_msg
+
+    # 4. Verify sensitive fragments are absent from all logged arguments and keyword values
     logged_str = " ".join(str(arg) for arg in mock_logger_error.call_args[0]) + " " + " ".join(f"{k}={v}" for k, v in mock_logger_error.call_args[1].items())
     assert "SuperSecretPassword123!" not in logged_str
     assert "db-host.internal" not in logged_str
     assert "postgresql://" not in logged_str
     assert "proddb" not in logged_str
     assert "FATAL" not in logged_str
+
+
+def test_get_primary_active_integration_error_logging_redacts_credentials(monkeypatch):
+    """Verify get_primary_active_integration logs safe metadata in visible message and redacts credentials."""
+    import mcp_server.zoho_recruit as zr_mod
+
+    class SimulatedOperationalError(Exception):
+        pass
+
+    class SimulatedDriverError(Exception):
+        pgcode = "42P01"
+
+    secret_msg = "connection to postgresql://user:SecretPassword456!@db-host.internal:5432/proddb failed"
+    simulated_exc = SimulatedOperationalError(secret_msg)
+    simulated_exc.orig = SimulatedDriverError("relation zoho_integrations does not exist")
+
+    @contextlib.contextmanager
+    def mock_failing_db_context():
+        mock_db = MagicMock()
+        mock_db.query.side_effect = simulated_exc
+        yield mock_db
+
+    monkeypatch.setattr(zr_mod, "get_db_context", mock_failing_db_context)
+
+    with patch.object(zr_mod.logger, "error") as mock_logger_error:
+        integration = zr_mod.get_primary_active_integration()
+
+    # 1. Gracefully returns None
+    assert integration is None
+
+    # 2. Logger called with visible message and sanitized kwargs
+    expected_msg = (
+        "mcp.resolve_primary_integration_failed "
+        "(error=SimulatedOperationalError driver=SimulatedDriverError sqlstate=42P01 stage=primary_integration_lookup)"
+    )
+    mock_logger_error.assert_called_once_with(
+        expected_msg,
+        error="SimulatedOperationalError",
+        driver="SimulatedDriverError",
+        sqlstate="42P01",
+        stage="primary_integration_lookup",
+    )
+
+    # 3. Verify visible message explicitly includes sanitized metadata
+    visible_msg = mock_logger_error.call_args[0][0]
+    assert "error=SimulatedOperationalError" in visible_msg
+    assert "driver=SimulatedDriverError" in visible_msg
+    assert "sqlstate=42P01" in visible_msg
+    assert "stage=primary_integration_lookup" in visible_msg
+
+    # 4. Verify sensitive fragments are absent from all logged arguments and keyword values
+    logged_str = " ".join(str(arg) for arg in mock_logger_error.call_args[0]) + " " + " ".join(f"{k}={v}" for k, v in mock_logger_error.call_args[1].items())
+    assert "SecretPassword456!" not in logged_str
+    assert "db-host.internal" not in logged_str
+    assert "postgresql://" not in logged_str
+    assert "proddb" not in logged_str
+
+
+def test_standard_stream_logging_emits_sanitized_fields_without_leaks(monkeypatch):
+    """Verify standard text stream handler (as used on Render) visibly outputs safe metadata and no secrets."""
+    import io
+    import logging
+    import mcp_server.zoho_recruit as zr_mod
+
+    class SimulatedOperationalError(Exception):
+        pass
+
+    class SimulatedDriverError(Exception):
+        pgcode = "08006"
+
+    secret_pw = "SuperSecretPassword123!"
+    secret_url = f"postgresql://user:{secret_pw}@db-host.internal:5432/proddb"
+    secret_sql = "SELECT * FROM sensitive_tenants WHERE secret_key = 'xyz'"
+    raw_error_text = f"FATAL: password authentication failed for {secret_url} while executing {secret_sql}"
+
+    simulated_exc = SimulatedOperationalError(raw_error_text)
+    simulated_exc.orig = SimulatedDriverError("driver connection terminated")
+
+    @contextlib.contextmanager
+    def mock_failing_db():
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.side_effect = simulated_exc
+        yield mock_db
+
+    monkeypatch.setattr(zr_mod, "get_db_context", mock_failing_db)
+
+    # Attach a standard stream handler mimicking Render's standard plain-text stdout stream
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    underlying_logger = zr_mod.logger.logger
+    underlying_logger.addHandler(handler)
+    prev_level = underlying_logger.level
+    underlying_logger.setLevel(logging.INFO)
+
+    try:
+        mcp_handler = zr_mod.ZohoRecruitMCPHandler()
+        res = mcp_handler.check_zoho_connection()
+
+        # 1. User-facing response remains identical
+        assert res == {"error": "database_error", "message": "Failed to check integration status."}
+
+        stream_output = stream.getvalue()
+
+        # 2. Visibly emitted in standard stream
+        assert "error=SimulatedOperationalError" in stream_output
+        assert "driver=SimulatedDriverError" in stream_output
+        assert "sqlstate=08006" in stream_output
+        assert "stage=primary_tenant_resolution" in stream_output
+
+        # 3. Sensitive items strictly absent from emitted stream
+        assert secret_pw not in stream_output
+        assert secret_url not in stream_output
+        assert "db-host.internal" not in stream_output
+        assert "sensitive_tenants" not in stream_output
+        assert "driver connection terminated" not in stream_output
+        assert "FATAL" not in stream_output
+    finally:
+        underlying_logger.removeHandler(handler)
+        underlying_logger.setLevel(prev_level)
+
+
 
