@@ -138,6 +138,123 @@ def verify_user_connection_token(
 
 # Tool specifications conform to Model Context Protocol JSON Schema
 MCP_TOOLS = [
+    # ── Connection & Metadata Tools ──────────────────────────────────────────
+    {
+        "name": "test_zoho_connection",
+        "description": (
+            "Verify active Zoho Recruit connection, configuration, and token validity for the organization. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data_center": {
+                    "type": "string",
+                    "description": "Optional Zoho data center (e.g. 'com', 'eu', 'in', 'au', 'jp', 'ca'). Defaults to configured application default.",
+                    "enum": ["com", "eu", "in", "au", "jp", "ca"],
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "check_zoho_connection",
+        "description": (
+            "Verify whether this user's organization has an active Zoho Recruit connection. "
+            "Returns connection status and onboarding URL if not connected. (Alias for test_zoho_connection)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data_center": {
+                    "type": "string",
+                    "description": "Optional Zoho data center (e.g. 'com', 'eu', 'in', 'au', 'jp', 'ca'). 'com.au' is accepted as an alias for 'au'.",
+                    "enum": ["com", "eu", "in", "au", "jp", "ca"],
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "connect_zoho_account",
+        "description": (
+            "Initiate Zoho Recruit connection for this user's organization. "
+            "Returns a secure, clickable browser authorization link to connect your Zoho Recruit account."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data_center": {
+                    "type": "string",
+                    "description": "Zoho data center where your account is hosted (e.g. 'com', 'eu', 'in', 'au', 'jp', 'ca'). 'com.au' is accepted as an alias for 'au'. Defaults to 'com'.",
+                    "enum": ["com", "eu", "in", "au", "jp", "ca"],
+                    "default": "com",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_recruitment_modules",
+        "description": (
+            "Discover available recruitment modules and their metadata in Zoho Recruit. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_recruitment_fields",
+        "description": (
+            "Retrieve official field specifications, types, and schema metadata for a Zoho Recruit module. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module": {
+                    "type": "string",
+                    "description": "Module API name (e.g. 'JobOpenings', 'Candidates', 'Applications').",
+                    "default": "JobOpenings",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+            "required": ["module"],
+        },
+    },
+    {
+        "name": "get_sync_status",
+        "description": (
+            "Retrieve administrative synchronization status, timestamps, and job history for the organization. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+
+    # ── Recruitment Retrieval Tools ──────────────────────────────────────────
     {
         "name": "list_job_openings",
         "description": (
@@ -163,6 +280,10 @@ MCP_TOOLS = [
                 "status": {
                     "type": "string",
                     "description": "Optional status filter (e.g., 'In-progress', 'Filled', 'Cancelled').",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
                 },
             },
         },
@@ -193,6 +314,10 @@ MCP_TOOLS = [
                 "source": {
                     "type": "string",
                     "description": "Optional acquisition source channel filter (e.g., 'LinkedIn', 'Referral').",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
                 },
             },
         },
@@ -226,23 +351,6 @@ MCP_TOOLS = [
                     "type": "string",
                     "description": "Optional application status or stage filter.",
                 },
-            },
-        },
-    },
-    {
-        "name": "check_zoho_connection",
-        "description": (
-            "Verify whether this user's organization has an active Zoho Recruit connection. "
-            "Returns connection status and onboarding URL if not connected."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "data_center": {
-                    "type": "string",
-                    "description": "Optional Zoho data center (e.g. 'in', 'com', 'eu'). Default is 'in'.",
-                    "enum": ["in", "com", "eu", "com.au", "com.cn", "jp"],
-                },
                 "connection_token": {
                     "type": "string",
                     "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
@@ -251,19 +359,124 @@ MCP_TOOLS = [
         },
     },
     {
-        "name": "connect_zoho_account",
+        "name": "get_candidate_details",
         "description": (
-            "Initiate Zoho Recruit connection for this user's organization. "
-            "Returns a secure, clickable browser authorization link to connect your Zoho Recruit account."
+            "Retrieve detailed profile for a specific candidate with candidate privacy minimization. "
+            "Excludes phone numbers, addresses, and salary details. Read-only."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "data_center": {
+                "candidate_id": {
                     "type": "string",
-                    "description": "Zoho data center where your account is hosted (e.g. 'in', 'com', 'eu'). Defaults to 'in'.",
-                    "enum": ["in", "com", "eu", "com.au", "com.cn", "jp"],
-                    "default": "in",
+                    "description": "External Zoho Candidate ID.",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+            "required": ["candidate_id"],
+        },
+    },
+    {
+        "name": "get_application_details",
+        "description": (
+            "Retrieve detailed record for a specific job application with candidate and requisition context. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string",
+                    "description": "External Zoho Application ID.",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+            "required": ["application_id"],
+        },
+    },
+
+    # ── Historical Tools ─────────────────────────────────────────────────────
+    {
+        "name": "get_selection_history",
+        "description": (
+            "Retrieve complete historical selection stage transition events, dwell duration in stage, "
+            "rejection reasons, and hiring outcome for an application. Never fabricates transitions from current status. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string",
+                    "description": "External Zoho Application ID.",
+                },
+                "candidate_id": {
+                    "type": "string",
+                    "description": "Optional Candidate ID for context lookup.",
+                },
+                "requisition_id": {
+                    "type": "string",
+                    "description": "Optional Requisition ID for context lookup.",
+                },
+                "include_activities": {
+                    "type": "boolean",
+                    "description": "Whether to include timeline activity records (default false).",
+                    "default": False,
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+            "required": ["application_id"],
+        },
+    },
+    {
+        "name": "get_candidate_history",
+        "description": (
+            "Retrieve candidate application history and timeline events across job requisitions. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {
+                    "type": "string",
+                    "description": "External Zoho Candidate ID.",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+            "required": ["candidate_id"],
+        },
+    },
+    {
+        "name": "get_recruitment_funnel",
+        "description": (
+            "Calculate recruitment stage funnel conversion rates (Applicant -> Screened -> Interviewed -> Offered -> Hired) "
+            "for an application cohort. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cohort_start": {
+                    "type": "string",
+                    "description": "ISO start date of application cohort (YYYY-MM-DD), e.g., '2026-01-01'.",
+                    "default": "2026-01-01",
+                },
+                "cohort_end": {
+                    "type": "string",
+                    "description": "ISO end date of application cohort (YYYY-MM-DD), e.g., '2026-06-30'.",
+                    "default": "2026-06-30",
+                },
+                "requisition_id": {
+                    "type": "string",
+                    "description": "Optional requisition identifier filter.",
                 },
                 "connection_token": {
                     "type": "string",
@@ -272,6 +485,8 @@ MCP_TOOLS = [
             },
         },
     },
+
+    # ── Analytics Tools ──────────────────────────────────────────────────────
     {
         "name": "compute_channel_yield",
         "description": (
@@ -315,6 +530,99 @@ MCP_TOOLS = [
                 },
             },
             "required": ["cohort_start", "cohort_end"],
+        },
+    },
+    {
+        "name": "get_channel_conversion",
+        "description": (
+            "Compute stage conversion rates, yield percentages, and rejection breakdown per sourcing channel. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cohort_start": {
+                    "type": "string",
+                    "description": "ISO start date of application cohort (YYYY-MM-DD), e.g., '2026-01-01'.",
+                    "default": "2026-01-01",
+                },
+                "cohort_end": {
+                    "type": "string",
+                    "description": "ISO end date of application cohort (YYYY-MM-DD), e.g., '2026-06-30'.",
+                    "default": "2026-06-30",
+                },
+                "requisition_id": {
+                    "type": "string",
+                    "description": "Optional requisition identifier filter.",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_channel_costs",
+        "description": (
+            "Calculate recruitment costs, total spend, and cost-per-hire per sourcing channel. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cohort_start": {
+                    "type": "string",
+                    "description": "ISO start date of application cohort (YYYY-MM-DD), e.g., '2026-01-01'.",
+                    "default": "2026-01-01",
+                },
+                "cohort_end": {
+                    "type": "string",
+                    "description": "ISO end date of application cohort (YYYY-MM-DD), e.g., '2026-06-30'.",
+                    "default": "2026-06-30",
+                },
+                "requisition_id": {
+                    "type": "string",
+                    "description": "Optional requisition identifier filter.",
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_channel_recommendations",
+        "description": (
+            "Generate actionable, evidence-based recruitment sourcing channel recommendations distinguishing measured facts. Read-only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cohort_start": {
+                    "type": "string",
+                    "description": "ISO start date of application cohort (YYYY-MM-DD), e.g., '2026-01-01'.",
+                    "default": "2026-01-01",
+                },
+                "cohort_end": {
+                    "type": "string",
+                    "description": "ISO end date of application cohort (YYYY-MM-DD), e.g., '2026-06-30'.",
+                    "default": "2026-06-30",
+                },
+                "requisition_id": {
+                    "type": "string",
+                    "description": "Optional requisition identifier filter.",
+                },
+                "min_sample_size": {
+                    "type": "integer",
+                    "description": "Minimum sample size for ranking eligibility (default 5).",
+                    "default": 5,
+                    "minimum": 1,
+                },
+                "connection_token": {
+                    "type": "string",
+                    "description": "Optional cryptographically signed user connection token for per-user tenant scoping.",
+                },
+            },
         },
     },
 ]
@@ -408,7 +716,7 @@ class MCPServerDispatcher:
                     }
                 target_handler = ZohoRecruitMCPHandler(tenant_id=verified["tid"])
             elif not target_handler.tenant_id:
-                if tool_name not in ("check_zoho_connection", "connect_zoho_account"):
+                if tool_name not in ("check_zoho_connection", "test_zoho_connection", "connect_zoho_account"):
                     return {
                         "jsonrpc": "2.0",
                         "id": req_id,
@@ -427,19 +735,16 @@ class MCPServerDispatcher:
                         }
                     }
 
-            if tool_name == "check_zoho_connection":
-                result_data = target_handler.check_zoho_connection(data_center=tool_args.get("data_center"))
+            if tool_name in ("check_zoho_connection", "test_zoho_connection"):
+                result_data = target_handler.test_zoho_connection(data_center=tool_args.get("data_center"))
             elif tool_name == "connect_zoho_account":
-                result_data = target_handler.connect_zoho_account(data_center=str(tool_args.get("data_center", "in")))
-            elif tool_name == "compute_channel_yield":
-                result_data = target_handler.compute_channel_yield(
-                    cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
-                    cohort_end=str(tool_args.get("cohort_end", "2026-06-30")),
-                    as_of_date=tool_args.get("as_of_date"),
-                    observation_days=int(tool_args.get("observation_days", 90)),
-                    requisition_id=tool_args.get("requisition_id"),
-                    min_sample_size=int(tool_args.get("min_sample_size", 5)),
-                )
+                result_data = target_handler.connect_zoho_account(data_center=tool_args.get("data_center"))
+            elif tool_name == "get_recruitment_modules":
+                result_data = target_handler.get_recruitment_modules()
+            elif tool_name == "get_recruitment_fields":
+                result_data = target_handler.get_recruitment_fields(module=str(tool_args.get("module", "JobOpenings")))
+            elif tool_name == "get_sync_status":
+                result_data = target_handler.get_sync_status()
             elif tool_name == "list_job_openings":
                 result_data = target_handler.list_job_openings(
                     page=tool_args.get("page", 1),
@@ -458,6 +763,53 @@ class MCPServerDispatcher:
                     per_page=tool_args.get("per_page", 20),
                     job_opening_id=tool_args.get("job_opening_id"),
                     status=tool_args.get("status"),
+                )
+            elif tool_name == "get_candidate_details":
+                result_data = target_handler.get_candidate_details(candidate_id=str(tool_args.get("candidate_id", "")))
+            elif tool_name == "get_application_details":
+                result_data = target_handler.get_application_details(application_id=str(tool_args.get("application_id", "")))
+            elif tool_name == "get_selection_history":
+                result_data = target_handler.get_selection_history(
+                    application_id=str(tool_args.get("application_id", "")),
+                    candidate_id=tool_args.get("candidate_id"),
+                    requisition_id=tool_args.get("requisition_id"),
+                    include_activities=bool(tool_args.get("include_activities", False)),
+                )
+            elif tool_name == "get_candidate_history":
+                result_data = target_handler.get_candidate_history(candidate_id=str(tool_args.get("candidate_id", "")))
+            elif tool_name == "get_recruitment_funnel":
+                result_data = target_handler.get_recruitment_funnel(
+                    cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
+                    cohort_end=str(tool_args.get("cohort_end", "2026-06-30")),
+                    requisition_id=tool_args.get("requisition_id"),
+                )
+            elif tool_name == "compute_channel_yield":
+                result_data = target_handler.compute_channel_yield(
+                    cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
+                    cohort_end=str(tool_args.get("cohort_end", "2026-06-30")),
+                    as_of_date=tool_args.get("as_of_date"),
+                    observation_days=int(tool_args.get("observation_days", 90)),
+                    requisition_id=tool_args.get("requisition_id"),
+                    min_sample_size=int(tool_args.get("min_sample_size", 5)),
+                )
+            elif tool_name == "get_channel_conversion":
+                result_data = target_handler.get_channel_conversion(
+                    cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
+                    cohort_end=str(tool_args.get("cohort_end", "2026-06-30")),
+                    requisition_id=tool_args.get("requisition_id"),
+                )
+            elif tool_name == "get_channel_costs":
+                result_data = target_handler.get_channel_costs(
+                    cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
+                    cohort_end=str(tool_args.get("cohort_end", "2026-06-30")),
+                    requisition_id=tool_args.get("requisition_id"),
+                )
+            elif tool_name == "get_channel_recommendations":
+                result_data = target_handler.get_channel_recommendations(
+                    cohort_start=str(tool_args.get("cohort_start", "2026-01-01")),
+                    cohort_end=str(tool_args.get("cohort_end", "2026-06-30")),
+                    requisition_id=tool_args.get("requisition_id"),
+                    min_sample_size=int(tool_args.get("min_sample_size", 5)),
                 )
             else:
                 return {
@@ -831,10 +1183,13 @@ def create_mcp_app(dispatcher: Optional[MCPServerDispatcher] = None) -> Starlett
     routes = [
         Route("/health", health_check, methods=["GET"]),
         Route("/ready", ready_check, methods=["GET"]),
+        Route("/version", health_check, methods=["GET"]),
         Route("/sse", sse_endpoint, methods=["GET"]),
         Route("/sse/{secret_key}", sse_capability_endpoint, methods=["GET"]),
         Route("/messages", messages_endpoint, methods=["POST"]),
         Route("/messages/{secret_key}", messages_capability_endpoint, methods=["POST"]),
+        Route("/mcp", messages_endpoint, methods=["POST"]),
+        Route("/mcp/{secret_key}", messages_capability_endpoint, methods=["POST"]),
     ]
     app = Starlette(routes=routes)
     app.state.dispatcher = dispatcher or MCPServerDispatcher()

@@ -44,6 +44,10 @@ def _build_engine(database_url: str | None = None):
     """
     settings = get_settings()
     url = database_url or settings.database_url
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://") and not url.startswith("postgresql+"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
     if url.startswith("postgresql"):
         engine = create_engine(

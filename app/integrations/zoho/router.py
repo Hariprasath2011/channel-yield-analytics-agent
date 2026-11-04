@@ -496,3 +496,55 @@ def trigger_sync(
         "started_at": sync_job.started_at.isoformat() if sync_job.started_at else None,
         "finished_at": sync_job.finished_at.isoformat() if sync_job.finished_at else None,
     }
+
+
+@router.get(
+    "/sync",
+    summary="Get recent synchronization jobs and status for caller's organization",
+)
+def get_sync_status(
+    limit: int = Query(10, ge=1, le=50, description="Max sync jobs to return"),
+    ctx: AuthenticatedContext = Depends(require_role("viewer")),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Retrieve administrative sync status, latest execution, and historical sync jobs."""
+    from app.persistence.models import SyncJob
+    integration = ZohoService.get_integration(db, ctx.tenant_id)
+    if not integration:
+        return {
+            "is_connected": False,
+            "status": "not_connected",
+            "message": "Zoho Recruit integration is not configured for this organization.",
+            "jobs": [],
+        }
+
+    jobs = (
+        db.query(SyncJob)
+        .filter(SyncJob.tenant_id == ctx.tenant_id)
+        .order_by(SyncJob.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "is_connected": integration.status == "active",
+        "status": integration.status,
+        "data_center": integration.data_center,
+        "last_sync_at": integration.last_sync_at.isoformat() if integration.last_sync_at else None,
+        "last_sync_status": integration.last_sync_status,
+        "total_jobs": len(jobs),
+        "jobs": [
+            {
+                "id": j.id,
+                "sync_type": j.sync_type,
+                "status": j.status,
+                "records_fetched": j.records_fetched,
+                "records_upserted": j.records_upserted,
+                "error_summary": j.error_summary,
+                "started_at": j.started_at.isoformat() if j.started_at else None,
+                "finished_at": j.finished_at.isoformat() if j.finished_at else None,
+                "created_at": j.created_at.isoformat() if j.created_at else None,
+            }
+            for j in jobs
+        ],
+    }

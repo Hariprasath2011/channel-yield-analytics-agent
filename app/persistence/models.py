@@ -408,3 +408,260 @@ class AuditEvent(Base):
     )
 
     tenant: Mapped[Optional["Tenant"]] = relationship("Tenant", back_populates="audit_events")
+
+
+# ─── Canonical Recruitment Relational Entities (Phase 4) ──────────────────────
+
+
+class SourceChannel(Base):
+    """Normalized sourcing channel definition and mapping table."""
+    __tablename__ = "source_channels"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "raw_source_value", name="uq_source_channels_tenant_raw"),
+        Index("ix_source_channels_tenant_channel", "tenant_id", "channel_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    raw_source_value: Mapped[str] = mapped_column(String(128), nullable=False)
+    category: Mapped[Optional[str]] = mapped_column(String(64), default="direct")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class Candidate(Base):
+    """Canonical candidate record with PII minimization."""
+    __tablename__ = "candidates"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "zoho_candidate_id", name="uq_candidates_tenant_zoho_id"),
+        Index("ix_candidates_tenant_status", "tenant_id", "candidate_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    zoho_candidate_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    full_name: Mapped[Optional[str]] = mapped_column(String(256))
+    masked_email: Mapped[Optional[str]] = mapped_column(String(320))
+    candidate_status: Mapped[Optional[str]] = mapped_column(String(64))
+    lead_source: Mapped[Optional[str]] = mapped_column(String(128))
+    channel_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("source_channels.id", ondelete="SET NULL")
+    )
+    created_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    updated_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class JobOpening(Base):
+    """Canonical job opening / requisition entity."""
+    __tablename__ = "job_openings"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "zoho_job_opening_id", name="uq_job_openings_tenant_zoho_id"),
+        Index("ix_job_openings_tenant_status", "tenant_id", "job_opening_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    zoho_job_opening_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    posting_title: Mapped[str] = mapped_column(String(256), nullable=False)
+    job_opening_status: Mapped[str] = mapped_column(String(64), nullable=False, default="open")
+    department: Mapped[Optional[str]] = mapped_column(String(128))
+    number_of_positions: Mapped[Optional[int]] = mapped_column(Integer, default=1)
+    opened_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    target_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class Application(Base):
+    """Canonical job application entity connecting candidate and requisition."""
+    __tablename__ = "applications"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "zoho_application_id", name="uq_applications_tenant_zoho_id"),
+        Index("ix_applications_tenant_req", "tenant_id", "job_opening_id"),
+        Index("ix_applications_tenant_cand", "tenant_id", "candidate_id"),
+        Index("ix_applications_tenant_channel", "tenant_id", "source_channel"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    zoho_application_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    candidate_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("candidates.id", ondelete="SET NULL")
+    )
+    job_opening_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("job_openings.id", ondelete="SET NULL")
+    )
+    channel_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("source_channels.id", ondelete="SET NULL")
+    )
+    application_status: Mapped[str] = mapped_column(String(64), nullable=False)
+    current_stage: Mapped[str] = mapped_column(String(64), nullable=False, default="applied")
+    source_channel: Mapped[str] = mapped_column(String(128), nullable=False, default="unknown")
+    attribution_method: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="application_field"
+    )
+    attribution_confidence: Mapped[Optional[float]] = mapped_column(Numeric(3, 2), default=1.0)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    application_outcome: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="in_progress"
+    )
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class ApplicationStageEvent(Base):
+    """Historical selection stage transition event for an application."""
+    __tablename__ = "application_stage_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "application_id", "stage", "entered_at",
+            name="uq_stage_events_tenant_app_stage_entered",
+        ),
+        Index("ix_stage_events_tenant_app", "tenant_id", "application_id"),
+        Index("ix_stage_events_tenant_stage", "tenant_id", "stage"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    application_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("applications.id", ondelete="CASCADE"), nullable=False
+    )
+    zoho_event_id: Mapped[Optional[str]] = mapped_column(String(128))
+    stage: Mapped[str] = mapped_column(String(64), nullable=False)
+    previous_stage: Mapped[Optional[str]] = mapped_column(String(64))
+    status: Mapped[Optional[str]] = mapped_column(String(64))
+    entered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    exited_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
+    duration_days: Mapped[Optional[float]] = mapped_column(Numeric(8, 2))
+    performed_by: Mapped[Optional[str]] = mapped_column(String(128))
+    comments: Mapped[Optional[str]] = mapped_column(Text)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(256))
+    interview_outcome: Mapped[Optional[str]] = mapped_column(String(64))
+    offer_status: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class RecruitmentActivity(Base):
+    """Recruitment activity associated with candidate or application."""
+    __tablename__ = "recruitment_activities"
+    __table_args__ = (
+        Index("ix_activities_tenant_app", "tenant_id", "application_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    application_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("applications.id", ondelete="CASCADE")
+    )
+    candidate_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("candidates.id", ondelete="CASCADE")
+    )
+    zoho_activity_id: Mapped[Optional[str]] = mapped_column(String(128))
+    activity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    performed_by: Mapped[Optional[str]] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class RecruitmentCost(Base):
+    """Recruitment spend associated with channels, requisitions, or periods."""
+    __tablename__ = "recruitment_costs"
+    __table_args__ = (
+        Index("ix_costs_tenant_channel", "tenant_id", "source_channel"),
+        Index("ix_costs_tenant_req", "tenant_id", "job_opening_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("source_channels.id", ondelete="SET NULL")
+    )
+    job_opening_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("job_openings.id", ondelete="SET NULL")
+    )
+    source_channel: Mapped[str] = mapped_column(String(128), nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="USD")
+    period_start: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    description: Mapped[Optional[str]] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class SyncLog(Base):
+    """Granular log record for scheduled synchronization runs."""
+    __tablename__ = "sync_logs"
+    __table_args__ = (
+        Index("ix_sync_logs_tenant_job", "tenant_id", "sync_job_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    sync_job_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("sync_jobs.id", ondelete="SET NULL")
+    )
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    records_read: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    records_upserted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    records_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    message: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+
+
+class AnalyticsSnapshot(Base):
+    """Persisted point-in-time calculation snapshots for fast retrieval."""
+    __tablename__ = "analytics_snapshots"
+    __table_args__ = (
+        Index("ix_snapshots_tenant_scope", "tenant_id", "cohort_start", "cohort_end"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    cohort_start: Mapped[str] = mapped_column(String(10), nullable=False)
+    cohort_end: Mapped[str] = mapped_column(String(10), nullable=False)
+    requisition_id: Mapped[Optional[str]] = mapped_column(String(128))
+    as_of_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    metrics_payload: Mapped[str] = mapped_column(Text, nullable=False)  # JSON
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+

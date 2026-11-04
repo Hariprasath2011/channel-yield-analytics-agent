@@ -297,6 +297,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         )
 
+    @app.get(
+        "/version",
+        summary="Version and build metadata",
+        tags=["System"],
+    )
+    async def version() -> dict[str, str]:
+        """Version probe returning application version, protocol compatibility, and environment."""
+        return {
+            "service": "channel-yield-analytics-agent",
+            "version": "1.0.0",
+            "mcp_version": "2024-11-05",
+            "environment": active_settings.env,
+        }
+
     # ── Auth & Identity Router ──
     from app.auth.router import router as auth_router
     from app.analytics.router import router as analytics_router

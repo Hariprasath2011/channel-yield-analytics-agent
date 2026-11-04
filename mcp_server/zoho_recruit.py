@@ -28,12 +28,14 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.core.logging import get_logger
+from app.analytics.engine import RecruitmentAnalyticsEngine
 from app.integrations.zoho.client import ZohoRecruitClient
 from app.integrations.zoho.crypto import decrypt_token, encrypt_token
 from app.integrations.zoho.mapper import map_zoho_application, map_zoho_job_opening
+from app.integrations.zoho.selection_history import SelectionHistoryService
 from app.integrations.zoho.service import ZohoService
 from app.persistence.database import get_db_context
-from app.persistence.models import OAuthState, Tenant, ZohoIntegration
+from app.persistence.models import OAuthState, SyncJob, Tenant, ZohoIntegration
 
 logger = get_logger(__name__)
 
@@ -404,15 +406,59 @@ class ZohoRecruitMCPHandler:
 
     # ─── Tool 4: check_zoho_connection & connect_zoho_account ─────────────────
 
+    DATA_CENTER_ALIASES: dict[str, str] = {
+        "com.au": "au",
+    }
+
+    @classmethod
+    def resolve_data_center(
+        cls, data_center: Optional[str] = None
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Resolve Zoho data center or return a structured validation error dict.
+
+        Returns:
+            (resolved_dc, None) on success
+            (None, error_dict) if an explicit non-empty unsupported value is provided
+        """
+        settings = get_settings()
+        from app.integrations.zoho.service import VALID_DATA_CENTERS
+
+        # Normalize raw input: strip whitespace and convert to lowercase
+        raw_str = (data_center or "").strip().lower()
+
+        if raw_str:
+            candidate = cls.DATA_CENTER_ALIASES.get(raw_str, raw_str)
+            if candidate in VALID_DATA_CENTERS:
+                return candidate, None
+
+            allowed_list = ", ".join(sorted(VALID_DATA_CENTERS))
+            return None, {
+                "status": "error",
+                "error": "invalid_data_center",
+                "message": (
+                    f"Unsupported Zoho data center: '{data_center}'. "
+                    f"Allowed data centers: {allowed_list} ('com.au' is also accepted for Australia)."
+                ),
+            }
+
+        # Omitted or empty/whitespace-only: fall back to configured setting or 'com'
+        configured = (getattr(settings, "zoho_data_center", None) or "").strip().lower()
+        if configured:
+            configured_candidate = cls.DATA_CENTER_ALIASES.get(configured, configured)
+            if configured_candidate in VALID_DATA_CENTERS:
+                return configured_candidate, None
+
+        return "com", None
+
     def _get_or_create_auth_url(
         self, db: Session, tenant_id: str, data_center: Optional[str] = None
     ) -> str:
         """Generate or reuse an unexpired Zoho OAuth authorization URL."""
         settings = get_settings()
-        dc = (data_center or getattr(settings, "zoho_data_center", None) or "in").lower().strip()
-        from app.integrations.zoho.service import VALID_DATA_CENTERS
-        if dc not in VALID_DATA_CENTERS:
-            dc = "in"
+        resolved_dc, err = self.resolve_data_center(data_center)
+        if err:
+            raise ValidationError(err["message"])
+        dc = resolved_dc or "com"
 
         cutoff = datetime.now(timezone.utc)
         existing_state = (
@@ -442,6 +488,10 @@ class ZohoRecruitMCPHandler:
 
     def check_zoho_connection(self, data_center: Optional[str] = None) -> dict[str, Any]:
         """Verify whether this user's organization has an active Zoho Recruit connection."""
+        dc, err = self.resolve_data_center(data_center)
+        if err:
+            return err
+
         stage = "session_scope"
         try:
             with get_db_context() as db:
@@ -464,7 +514,7 @@ class ZohoRecruitMCPHandler:
                     }
 
                 stage = "auth_url_generation"
-                auth_url = self._get_or_create_auth_url(db, target_tenant_id, data_center=data_center)
+                auth_url = self._get_or_create_auth_url(db, target_tenant_id, data_center=dc)
                 status_label = "unconfigured" if not self._tenant_id else (integration.status if integration else "pending_auth")
                 return {
                     "connected": False,
@@ -487,9 +537,11 @@ class ZohoRecruitMCPHandler:
             )
             return {"error": "database_error", "message": "Failed to check integration status."}
 
-    def connect_zoho_account(self, data_center: str = "in") -> dict[str, Any]:
+    def connect_zoho_account(self, data_center: Optional[str] = None) -> dict[str, Any]:
         """Generate a clickable Zoho Recruit OAuth authorization link to connect the account."""
         res = self.check_zoho_connection(data_center=data_center)
+        if res.get("status") == "error":
+            return res
         if not res.get("connected"):
             res["status"] = "requires_authorization"
         return res
@@ -645,3 +697,398 @@ class ZohoRecruitMCPHandler:
         except Exception as exc:
             logger.error("mcp.compute_channel_yield_unexpected_error", error=type(exc).__name__)
             return {"status": "error", "error": "calculation_error", "message": "Failed to calculate channel yield from Zoho Recruit data."}
+
+    # ─── Additional Phase 8 MCP Read-Only Tools ───────────────────────────────
+
+    def test_zoho_connection(self, data_center: Optional[str] = None) -> dict[str, Any]:
+        """Verify active Zoho Recruit connection (primary MCP name conforming to BRD)."""
+        return self.check_zoho_connection(data_center=data_center)
+
+    def get_recruitment_modules(self) -> dict[str, Any]:
+        """Discover available recruitment modules and their metadata in Zoho Recruit."""
+        try:
+            with get_db_context() as db:
+                client, access_token = self._get_authenticated_client(db)
+            raw = client.get_module_metadata(access_token)
+            modules = raw.get("modules", []) if isinstance(raw, dict) else []
+            return {
+                "status": "success",
+                "count": len(modules),
+                "modules": [
+                    {
+                        "api_name": m.get("api_name"),
+                        "singular_label": m.get("singular_label"),
+                        "plural_label": m.get("plural_label"),
+                        "searchable": m.get("searchable", True),
+                    }
+                    for m in modules if isinstance(m, dict)
+                ],
+            }
+        except RateLimitError as exc:
+            return {"status": "error", "error": "rate_limited", "message": str(exc.message)}
+        except (OAuthError, NotFoundError, ValidationError, IntegrationError) as exc:
+            return {"status": "error", "error": exc.code if hasattr(exc, "code") else "error", "message": str(exc.message if hasattr(exc, "message") else exc)}
+        except Exception as exc:
+            logger.error("mcp.get_modules_unexpected_error", error=type(exc).__name__)
+            return {"status": "error", "error": "integration_error", "message": "Failed to retrieve module metadata."}
+
+    def get_recruitment_fields(self, module: str) -> dict[str, Any]:
+        """Retrieve official field specifications and schema metadata for a module."""
+        clean_mod = str(module).strip()
+        if not clean_mod:
+            return {"status": "error", "error": "missing_module", "message": "Module name is required."}
+        try:
+            with get_db_context() as db:
+                client, access_token = self._get_authenticated_client(db)
+            raw = client.get_module_fields(clean_mod, access_token)
+            fields = raw.get("fields", []) if isinstance(raw, dict) else []
+            return {
+                "status": "success",
+                "module": clean_mod,
+                "count": len(fields),
+                "fields": [
+                    {
+                        "api_name": f.get("api_name"),
+                        "field_label": f.get("field_label"),
+                        "data_type": f.get("data_type"),
+                        "mandatory": f.get("system_mandatory", False) or f.get("required", False),
+                        "read_only": f.get("read_only", False),
+                    }
+                    for f in fields if isinstance(f, dict)
+                ],
+            }
+        except RateLimitError as exc:
+            return {"status": "error", "error": "rate_limited", "message": str(exc.message)}
+        except (OAuthError, NotFoundError, ValidationError, IntegrationError) as exc:
+            return {"status": "error", "error": exc.code if hasattr(exc, "code") else "error", "message": str(exc.message if hasattr(exc, "message") else exc)}
+        except Exception as exc:
+            logger.error("mcp.get_fields_unexpected_error", module=clean_mod, error=type(exc).__name__)
+            return {"status": "error", "error": "integration_error", "message": f"Failed to retrieve fields for {clean_mod}."}
+
+    def get_sync_status(self) -> dict[str, Any]:
+        """Retrieve administrative synchronization status and history for the organization."""
+        if not self._tenant_id:
+            return {"status": "error", "error": "unauthorized", "message": "Tenant not resolved."}
+        try:
+            with get_db_context() as db:
+                integration = (
+                    db.query(ZohoIntegration)
+                    .filter(ZohoIntegration.tenant_id == self._tenant_id)
+                    .first()
+                )
+                if not integration:
+                    return {"status": "not_connected", "message": "Zoho Recruit is not connected."}
+
+                latest_sync = (
+                    db.query(SyncJob)
+                    .filter(SyncJob.tenant_id == self._tenant_id)
+                    .order_by(SyncJob.created_at.desc())
+                    .first()
+                )
+
+                return {
+                    "status": "success",
+                    "integration_status": integration.status,
+                    "data_center": integration.data_center,
+                    "zoho_org_id": integration.zoho_org_id,
+                    "last_sync_at": integration.last_sync_at.isoformat() if integration.last_sync_at else None,
+                    "last_sync_status": integration.last_sync_status,
+                    "latest_job": {
+                        "job_id": latest_sync.id,
+                        "status": latest_sync.status,
+                        "sync_type": latest_sync.sync_type,
+                        "records_fetched": latest_sync.records_fetched,
+                        "records_upserted": latest_sync.records_upserted,
+                        "started_at": latest_sync.started_at.isoformat() if latest_sync.started_at else None,
+                        "finished_at": latest_sync.finished_at.isoformat() if latest_sync.finished_at else None,
+                    } if latest_sync else None,
+                }
+        except Exception as exc:
+            logger.error("mcp.get_sync_status_error", error=type(exc).__name__)
+            return {"status": "error", "error": "database_error", "message": "Failed to retrieve sync status."}
+
+    def get_candidate_details(self, candidate_id: str) -> dict[str, Any]:
+        """Retrieve single candidate record with candidate PII minimization."""
+        clean_id = str(candidate_id).strip()
+        if not clean_id:
+            return {"status": "error", "error": "missing_candidate_id", "message": "candidate_id is required."}
+        try:
+            with get_db_context() as db:
+                client, access_token = self._get_authenticated_client(db)
+            raw = client.get_candidate_by_id(clean_id, access_token)
+            data = raw.get("data", []) if isinstance(raw, dict) else []
+            rec = data[0] if (isinstance(data, list) and data) else (raw if "id" in raw else None)
+
+            if not rec:
+                return {"status": "error", "error": "not_found", "message": f"Candidate '{clean_id}' not found."}
+
+            return {
+                "status": "success",
+                "candidate": {
+                    "id": str(rec.get("id") or clean_id),
+                    "full_name": str(rec.get("Full_Name") or f"{rec.get('First_Name', '')} {rec.get('Last_Name', '')}".strip() or "Candidate"),
+                    "candidate_status": rec.get("Candidate_Status") or rec.get("Status"),
+                    "source": rec.get("Source") or rec.get("Lead_Source") or "unknown",
+                    "highest_qualification": rec.get("Highest_Qualification_Held"),
+                    "current_job_title": rec.get("Current_Job_Title"),
+                    "experience_in_years": rec.get("Experience_in_Years"),
+                    "city": rec.get("City"),
+                    "country": rec.get("Country"),
+                    "created_time": rec.get("Created_Time"),
+                },
+            }
+        except RateLimitError as exc:
+            return {"status": "error", "error": "rate_limited", "message": str(exc.message)}
+        except (OAuthError, NotFoundError, ValidationError, IntegrationError) as exc:
+            return {"status": "error", "error": exc.code if hasattr(exc, "code") else "error", "message": str(exc.message if hasattr(exc, "message") else exc)}
+        except Exception as exc:
+            logger.error("mcp.get_candidate_details_error", candidate_id=clean_id, error=type(exc).__name__)
+            return {"status": "error", "error": "integration_error", "message": f"Failed to retrieve candidate {clean_id}."}
+
+    def get_application_details(self, application_id: str) -> dict[str, Any]:
+        """Retrieve single application record with job and candidate context."""
+        clean_id = str(application_id).strip()
+        if not clean_id:
+            return {"status": "error", "error": "missing_application_id", "message": "application_id is required."}
+        try:
+            with get_db_context() as db:
+                client, access_token = self._get_authenticated_client(db)
+            raw = client.get_application_by_id(clean_id, access_token)
+            data = raw.get("data", []) if isinstance(raw, dict) else []
+            rec = data[0] if (isinstance(data, list) and data) else (raw if "id" in raw else None)
+
+            if not rec:
+                return {"status": "error", "error": "not_found", "message": f"Application '{clean_id}' not found."}
+
+            cand_obj = rec.get("Candidate_ID") or {}
+            cand_id = cand_obj.get("id") if isinstance(cand_obj, dict) else str(cand_obj)
+            job_obj = rec.get("Job_Opening_ID") or {}
+            job_id = job_obj.get("id") if isinstance(job_obj, dict) else str(job_obj)
+
+            return {
+                "status": "success",
+                "application": {
+                    "id": str(rec.get("id") or clean_id),
+                    "candidate_id": str(cand_id or ""),
+                    "candidate_name": cand_obj.get("name") if isinstance(cand_obj, dict) else None,
+                    "job_opening_id": str(job_id or ""),
+                    "job_title": rec.get("Posting_Title") or (job_obj.get("name") if isinstance(job_obj, dict) else None),
+                    "status": rec.get("Application_Status") or rec.get("Candidate_Status") or "Applied",
+                    "source": rec.get("Lead_Source") or rec.get("Source") or "unknown",
+                    "applied_at": rec.get("Created_Time"),
+                    "joining_date": rec.get("Joining_Date") or rec.get("Joined_Date"),
+                },
+            }
+        except RateLimitError as exc:
+            return {"status": "error", "error": "rate_limited", "message": str(exc.message)}
+        except (OAuthError, NotFoundError, ValidationError, IntegrationError) as exc:
+            return {"status": "error", "error": exc.code if hasattr(exc, "code") else "error", "message": str(exc.message if hasattr(exc, "message") else exc)}
+        except Exception as exc:
+            logger.error("mcp.get_application_details_error", application_id=clean_id, error=type(exc).__name__)
+            return {"status": "error", "error": "integration_error", "message": f"Failed to retrieve application {clean_id}."}
+
+    def get_selection_history(
+        self,
+        application_id: str,
+        candidate_id: Optional[str] = None,
+        requisition_id: Optional[str] = None,
+        include_activities: bool = False,
+    ) -> dict[str, Any]:
+        """Retrieve complete historical stage transition details for an application."""
+        clean_id = str(application_id).strip()
+        if not clean_id:
+            return {"status": "error", "error": "missing_application_id", "message": "application_id is required."}
+        try:
+            with get_db_context() as db:
+                client, access_token = self._get_authenticated_client(db)
+            return SelectionHistoryService.get_selection_history(
+                client=client,
+                access_token=access_token,
+                application_id=clean_id,
+                candidate_id=candidate_id,
+                requisition_id=requisition_id,
+                include_activities=include_activities,
+            )
+        except RateLimitError as exc:
+            return {"status": "error", "error": "rate_limited", "message": str(exc.message)}
+        except (OAuthError, NotFoundError, ValidationError, IntegrationError) as exc:
+            return {"status": "error", "error": exc.code if hasattr(exc, "code") else "error", "message": str(exc.message if hasattr(exc, "message") else exc)}
+        except Exception as exc:
+            logger.error("mcp.get_selection_history_error", application_id=clean_id, error=type(exc).__name__)
+            return {"status": "error", "error": "integration_error", "message": f"Failed to retrieve selection history for {clean_id}."}
+
+    def get_candidate_history(self, candidate_id: str) -> dict[str, Any]:
+        """Retrieve candidate application history and timeline events across requisitions."""
+        clean_id = str(candidate_id).strip()
+        if not clean_id:
+            return {"status": "error", "error": "missing_candidate_id", "message": "candidate_id is required."}
+        try:
+            with get_db_context() as db:
+                client, access_token = self._get_authenticated_client(db)
+            raw_timeline = client.get_record_timeline("Candidates", clean_id, access_token)
+            timeline_events = raw_timeline.get("data", []) if isinstance(raw_timeline, dict) else []
+
+            # Retrieve candidate applications
+            raw_apps = client.search_applications(access_token, criteria=f"(Candidate_ID:equals:{clean_id})")
+            apps = raw_apps.get("data", []) if isinstance(raw_apps, dict) else []
+
+            return {
+                "status": "success",
+                "candidate_id": clean_id,
+                "applications_count": len(apps),
+                "applications": [
+                    {
+                        "application_id": str(a.get("id")),
+                        "job_opening_id": str((a.get("Job_Opening_ID") or {}).get("id") if isinstance(a.get("Job_Opening_ID"), dict) else (a.get("Job_Opening_ID") or "")),
+                        "status": a.get("Application_Status") or a.get("Candidate_Status"),
+                        "created_time": a.get("Created_Time"),
+                    }
+                    for a in apps if isinstance(a, dict)
+                ],
+                "timeline_events": [
+                    {
+                        "activity_id": str(e.get("id") or ""),
+                        "activity_type": e.get("activity_type") or e.get("Subject") or "General",
+                        "timestamp": e.get("Created_Time") or e.get("Modified_Time"),
+                        "performed_by": (e.get("Created_By") or {}).get("name") if isinstance(e.get("Created_By"), dict) else str(e.get("Created_By") or ""),
+                        "summary": e.get("Description") or e.get("Notes") or e.get("Subject"),
+                    }
+                    for e in timeline_events if isinstance(e, dict)
+                ],
+            }
+        except RateLimitError as exc:
+            return {"status": "error", "error": "rate_limited", "message": str(exc.message)}
+        except (OAuthError, NotFoundError, ValidationError, IntegrationError) as exc:
+            return {"status": "error", "error": exc.code if hasattr(exc, "code") else "error", "message": str(exc.message if hasattr(exc, "message") else exc)}
+        except Exception as exc:
+            logger.error("mcp.get_candidate_history_error", candidate_id=clean_id, error=type(exc).__name__)
+            return {"status": "error", "error": "integration_error", "message": f"Failed to retrieve history for candidate {clean_id}."}
+
+    def get_recruitment_funnel(
+        self,
+        cohort_start: str = "2026-01-01",
+        cohort_end: str = "2026-06-30",
+        requisition_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Compute recruitment stage funnel conversion rates for an application cohort."""
+        try:
+            analysis = self._run_analytics(cohort_start, cohort_end, requisition_id=requisition_id)
+            if analysis.get("status") == "error":
+                return analysis
+            return {
+                "status": "success",
+                "cohort_window": {"cohort_start": cohort_start, "cohort_end": cohort_end},
+                "requisition_id": requisition_id,
+                "funnel": analysis.get("stage_conversions", {}),
+            }
+        except Exception as exc:
+            logger.error("mcp.get_recruitment_funnel_error", error=type(exc).__name__)
+            return {"status": "error", "error": "calculation_error", "message": "Failed to compute recruitment funnel."}
+
+    def get_channel_conversion(
+        self,
+        cohort_start: str = "2026-01-01",
+        cohort_end: str = "2026-06-30",
+        requisition_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Compute stage conversion rates and yield broken down by sourcing channel."""
+        try:
+            analysis = self._run_analytics(cohort_start, cohort_end, requisition_id=requisition_id)
+            if analysis.get("status") == "error":
+                return analysis
+            return {
+                "status": "success",
+                "cohort_window": {"cohort_start": cohort_start, "cohort_end": cohort_end},
+                "channel_yields": analysis.get("channel_yields", []),
+                "ranked_channels": analysis.get("ranked_channels", []),
+                "rejection_breakdown": analysis.get("rejection_analysis", {}).get("channel_rejection_rates", []),
+            }
+        except Exception as exc:
+            logger.error("mcp.get_channel_conversion_error", error=type(exc).__name__)
+            return {"status": "error", "error": "calculation_error", "message": "Failed to compute channel conversion."}
+
+    def get_channel_costs(
+        self,
+        cohort_start: str = "2026-01-01",
+        cohort_end: str = "2026-06-30",
+        requisition_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Retrieve recruitment costs and cost-per-hire per sourcing channel."""
+        try:
+            analysis = self._run_analytics(cohort_start, cohort_end, requisition_id=requisition_id)
+            if analysis.get("status") == "error":
+                return analysis
+            return {
+                "status": "success",
+                "cohort_window": {"cohort_start": cohort_start, "cohort_end": cohort_end},
+                "costs": analysis.get("cost_analytics", {}),
+            }
+        except Exception as exc:
+            logger.error("mcp.get_channel_costs_error", error=type(exc).__name__)
+            return {"status": "error", "error": "calculation_error", "message": "Failed to calculate channel costs."}
+
+    def get_channel_recommendations(
+        self,
+        cohort_start: str = "2026-01-01",
+        cohort_end: str = "2026-06-30",
+        requisition_id: Optional[str] = None,
+        min_sample_size: int = 5,
+    ) -> dict[str, Any]:
+        """Generate evidence-based sourcing channel recommendations distinguishing measured facts."""
+        try:
+            analysis = self._run_analytics(
+                cohort_start,
+                cohort_end,
+                requisition_id=requisition_id,
+                min_sample_size=min_sample_size,
+            )
+            if analysis.get("status") == "error":
+                return analysis
+            return {
+                "status": "success",
+                "cohort_window": {"cohort_start": cohort_start, "cohort_end": cohort_end},
+                "summary": analysis.get("summary", {}),
+                "recommendations": analysis.get("recommendations", {}),
+            }
+        except Exception as exc:
+            logger.error("mcp.get_recommendations_error", error=type(exc).__name__)
+            return {"status": "error", "error": "calculation_error", "message": "Failed to generate recommendations."}
+
+    def _run_analytics(
+        self,
+        cohort_start: str,
+        cohort_end: str,
+        requisition_id: Optional[str] = None,
+        min_sample_size: int = 5,
+    ) -> dict[str, Any]:
+        """Internal helper running in-memory analytics pipeline across Zoho records."""
+        with get_db_context() as db:
+            client, access_token = self._get_authenticated_client(db)
+
+        raw_jobs = client.fetch_all_module_records("JobOpenings", access_token, max_pages=10)
+        raw_candidates = client.fetch_all_module_records("Candidates", access_token, max_pages=20)
+        raw_applications = client.fetch_all_module_records("Applications", access_token, max_pages=20)
+
+        cand_source_map: dict[str, str] = {}
+        for c in raw_candidates:
+            cid = str(c.get("id") or "")
+            if cid:
+                cand_source_map[cid] = str(c.get("Lead_Source") or c.get("Source") or "unknown").strip()
+
+        mapped_jobs = [map_zoho_job_opening(j, self._tenant_id or "tenant", "mcp_run") for j in raw_jobs]
+        mapped_apps = [map_zoho_application(a, cand_source_map, self._tenant_id or "tenant", "mcp_run") for a in raw_applications]
+
+        as_of_today = datetime.now(timezone.utc).date().isoformat()
+        return RecruitmentAnalyticsEngine.analyze(
+            requisitions=mapped_jobs,
+            applications=mapped_apps,
+            stage_events=[],
+            costs=[],
+            cohort_start=cohort_start,
+            cohort_end=cohort_end,
+            as_of_date=as_of_today,
+            observation_days=90,
+            requisition_id=requisition_id,
+            min_sample_size=min_sample_size,
+        )
+

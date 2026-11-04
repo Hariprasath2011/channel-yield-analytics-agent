@@ -90,26 +90,75 @@ class ZohoService:
         return state_token
 
     @classmethod
-    def _claim_oauth_state(cls, db: Session, tenant_id: str, state_token: str) -> None:
-        """Atomically consume a one-time OAuth state row and commit immediately."""
+    def _claim_oauth_state(
+        cls,
+        db: Session,
+        state_token: str,
+        expected_tenant_id: Optional[str] = None,
+    ) -> str:
+        """Atomically consume a one-time OAuth state row and return the bound tenant_id.
+
+        If expected_tenant_id is provided, it is asserted in the WHERE clause.
+        """
         cutoff = _expiration_cutoff(db)
+        conditions = [
+            OAuthState.state_token == state_token,
+            OAuthState.provider == "zoho_recruit",
+            OAuthState.used == False,  # noqa: E712
+            OAuthState.expires_at > cutoff,
+        ]
+        if expected_tenant_id is not None:
+            conditions.append(OAuthState.tenant_id == expected_tenant_id)
+
         stmt = (
             update(OAuthState)
-            .where(
-                OAuthState.tenant_id == tenant_id,
-                OAuthState.state_token == state_token,
-                OAuthState.provider == "zoho_recruit",
-                OAuthState.used == False,  # noqa: E712
-                OAuthState.expires_at > cutoff,
-            )
+            .where(*conditions)
             .values(used=True)
+            .returning(OAuthState.tenant_id)
             .execution_options(synchronize_session=False)
         )
-        res = db.execute(stmt)
-        if not res.rowcount:
-            logger.warning("zoho.oauth_state_invalid_or_expired", tenant_id=tenant_id)
-            raise OAuthError(OAUTH_STATE_ERROR)
-        db.commit()
+        try:
+            res = db.execute(stmt)
+            row = res.fetchone()
+            if not row:
+                db.rollback()
+                logger.warning("zoho.oauth_state_invalid_or_expired")
+                raise OAuthError(OAUTH_STATE_ERROR)
+            db.commit()
+            return str(row[0])
+        except OAuthError:
+            raise
+        except Exception:
+            db.rollback()
+            raise
+
+    @classmethod
+    def invalidate_oauth_state(cls, db: Session, state_token: str) -> bool:
+        """Safely invalidate an unexpired, unused OAuth state if user cancels or denies consent."""
+        if not state_token or not isinstance(state_token, str):
+            return False
+        cutoff = _expiration_cutoff(db)
+        try:
+            stmt = (
+                update(OAuthState)
+                .where(
+                    OAuthState.state_token == state_token,
+                    OAuthState.provider == "zoho_recruit",
+                    OAuthState.used == False,  # noqa: E712
+                    OAuthState.expires_at > cutoff,
+                )
+                .values(used=True)
+                .execution_options(synchronize_session=False)
+            )
+            res = db.execute(stmt)
+            if res.rowcount:
+                db.commit()
+                return True
+            db.rollback()
+            return False
+        except Exception:
+            db.rollback()
+            return False
 
     @staticmethod
     def _parse_expires_in(raw_expires_in: Any) -> int:
@@ -129,17 +178,19 @@ class ZohoService:
         cls,
         db: Session,
         *,
-        tenant_id: str,
         state_token: str,
         code: str,
         client: ZohoRecruitClient,
+        tenant_id: Optional[str] = None,
     ) -> ZohoIntegration:
         """Atomically claim CSRF state, exchange auth code for tokens, and store Fernet-encrypted credentials."""
         now_utc = datetime.now(timezone.utc)
 
         # Consume state at the database before any external HTTP call. A later
         # rollback of token persistence must not revive this claim.
-        cls._claim_oauth_state(db, tenant_id, state_token)
+        claimed_tenant_id = cls._claim_oauth_state(
+            db, state_token=state_token, expected_tenant_id=tenant_id
+        )
 
         bound_dc = cls.extract_data_center(state_token)
         client.set_data_center(bound_dc)
@@ -148,7 +199,7 @@ class ZohoService:
 
         access_token = token_data.get("access_token") if isinstance(token_data, dict) else None
         if not access_token or not isinstance(access_token, str) or not access_token.strip():
-            logger.error("zoho.oauth_token_response_invalid", tenant_id=tenant_id)
+            logger.error("zoho.oauth_token_response_invalid")
             raise OAuthError("Zoho token response is missing a valid access_token.")
 
         refresh_token = token_data.get("refresh_token") if isinstance(token_data, dict) else None
@@ -164,10 +215,10 @@ class ZohoService:
             raise OAuthError("Zoho token response has an invalid expires_in value.") from exc
 
         try:
-            integration = cls.get_integration(db, tenant_id)
+            integration = cls.get_integration(db, claimed_tenant_id)
             if not integration:
                 integration = ZohoIntegration(
-                    tenant_id=tenant_id,
+                    tenant_id=claimed_tenant_id,
                     data_center=bound_dc,
                 )
                 db.add(integration)
@@ -183,7 +234,7 @@ class ZohoService:
             integration.zoho_org_id = token_data.get("api_domain")
 
             audit = AuditEvent(
-                tenant_id=tenant_id,
+                tenant_id=claimed_tenant_id,
                 actor_type="user",
                 event_type="zoho.oauth_connected",
                 resource_type="zoho_integration",

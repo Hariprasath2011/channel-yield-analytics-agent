@@ -12,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 from app.auth.passwords import hash_password
 from app.auth.tokens import create_access_token
 from app.core.exceptions import ConflictError, OAuthError, RateLimitError
-from app.integrations.zoho.client import DATACENTER_DOMAINS, ZohoRecruitClient
+from app.integrations.zoho.client import DATACENTER_DOMAINS, DEFAULT_SCOPES, ZohoRecruitClient
 from app.integrations.zoho.crypto import decrypt_token, encrypt_token
 from app.integrations.zoho.mapper import map_zoho_application, map_zoho_job_opening
 from app.integrations.zoho.service import ZohoService
@@ -208,6 +208,43 @@ def test_datacenter_domains_and_authorization_url():
         assert "response_type=code" in auth_url
         assert "state=csrf_state_123" in auth_url
         assert domains["accounts"] in auth_url
+
+
+def test_authorization_url_scopes_use_official_singular_names():
+    """Verify authorization URL requests official Zoho Recruit v2 singular read scopes in order."""
+    from urllib.parse import parse_qs, urlparse
+
+    client = ZohoRecruitClient(
+        client_id="test_client_id",
+        client_secret="test_client_secret",
+        redirect_uri="https://app.test/callback",
+        data_center="in",
+    )
+    auth_url = client.get_authorization_url(state="csrf_state_123")
+    parsed = urlparse(auth_url)
+    params = parse_qs(parsed.query)
+
+    assert "scope" in params
+    requested_scopes = params["scope"][0].split(",")
+
+    expected_scopes = [
+        "ZohoRecruit.modules.jobopening.READ",
+        "ZohoRecruit.modules.candidate.READ",
+        "ZohoRecruit.modules.application.READ",
+    ]
+    # Exact three expected read-only scopes are present, in order
+    assert requested_scopes == expected_scopes
+    assert DEFAULT_SCOPES == expected_scopes
+
+    # Assert previous plural scope names are strictly absent
+    invalid_plural_scopes = [
+        "ZohoRecruit.modules.jobopenings.READ",
+        "ZohoRecruit.modules.candidates.READ",
+        "ZohoRecruit.modules.applications.READ",
+    ]
+    for invalid_scope in invalid_plural_scopes:
+        assert invalid_scope not in requested_scopes
+        assert invalid_scope not in auth_url
 
 
 def test_fernet_token_encryption_and_decryption():

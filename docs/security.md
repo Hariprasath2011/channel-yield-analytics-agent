@@ -34,8 +34,34 @@ The Channel Yield Analytics Agent is designed to operate in multi-tenant environ
 - Revocation: Immediate status update (`is_active = False`). Expired or revoked keys return `HTTP 401 Unauthorized`.
 
 ### 2.4 User Provisioning, Membership, and Administrative Bootstrap
-- **No Insecure Public Self-Registration**: There is no unauthenticated endpoint that permits creating arbitrary tenants or administrator accounts.
-- **Administrative Bootstrap**: Initial tenant and owner accounts are created exclusively via administrative CLI commands or controlled deployment scripts requiring direct database/host access (`CY_ADMIN_BOOTSTRAP_TOKEN` or local CLI invocation).
+- **No Insecure Public Self-Registration**: There is no unauthenticated endpoint that permits creating arbitrary tenants or administrator accounts. All public registration endpoints are strictly forbidden.
+- **Administrative Bootstrap CLI**: Initial tenant and owner accounts are provisioned exclusively through a local administrative CLI command requiring direct host/container and database access:
+  ```bash
+  python -m app.cli.bootstrap --name "<Organization Name>" --slug "<tenant-slug>" --email "<owner-email>" [--full-name "<Owner Name>"] [--password-stdin] [--dry-run]
+  ```
+  * **Command Arguments & Options**:
+    * `--name`, `--tenant-name` (required): Organization display name (up to 256 characters).
+    * `--slug`, `--tenant-slug` (required): Unique URL identifier (2-64 characters, lowercase alphanumeric and hyphens, no leading/trailing hyphens).
+    * `--email`, `--owner-email` (required): Valid email address for the initial owner user (up to 320 characters).
+    * `--full-name`, `--owner-name` (optional): Display name of the owner user.
+    * `--password-stdin` (optional): Safely reads the initial owner password from standard input (recommended for automated scripts and deployment pipelines).
+    * `--dry-run` (optional): Executes preflight validation, checks database connectivity, and verifies uniqueness without persisting records.
+  * **Secure Password Acquisition**:
+    * Passwords are **never** passed via command-line arguments to prevent leakage in process tables (`ps`), `/proc`, shell history, and CI logs.
+    * In interactive sessions, the CLI prompts for the password with hidden input (`getpass`) and requires confirmation.
+    * In non-interactive automation, the password must be supplied via `--password-stdin` (e.g. `echo "$OWNER_PASSWORD" | python -m app.cli.bootstrap ... --password-stdin`).
+    * **Length & Security Rules**: Passwords must be at least 8 characters long and **must not exceed 72 UTF-8 bytes** (the native bcrypt limitation). Passwords exceeding 72 bytes are rejected with a validation error to prevent silent truncation.
+  * **Database Configuration**:
+    * Uses the existing centralized application configuration (`CY_DATABASE_URL`) via `get_db_context()`. No secondary configuration system or direct manual connection string is needed.
+  * **Transaction Safety & Duplicate Handling**:
+    * Inspects the database prior to record creation. If the requested tenant slug already exists, the command refuses execution (`ConflictError`) and aborts without adopting, modifying, or resetting existing accounts.
+    * Operations are executed in an atomic transaction. If tenant, user, or membership creation fails, all staged changes are rolled back immediately. Database uniqueness constraints (e.g. `tenants.slug` and `uq_users_tenant_email`) are handled safely without exposing internal exceptions.
+  * **Preconditions & Expected Output**:
+    * Preconditions: The target database must be reachable, and migrations must have created the `tenants`, `users`, and `memberships` tables.
+    * Success output clearly reports the created tenant ID, slug, user ID, owner email, and role, without printing passwords, password hashes, secrets, or database URLs.
+  * **Production Operational Guidance**:
+    * **WARNING**: Do NOT run the bootstrap command blindly against an existing production database. Always verify whether the organization has already been provisioned, or run with `--dry-run` first to validate parameters safely.
+    * Once the initial owner account is bootstrapped, the owner authenticates via `POST /v2/auth/token` and provisions additional members (`POST /v2/auth/members`) or machine API keys (`POST /v2/auth/api-keys`).
 - **Tenant Membership**: Users belong to tenants through `Membership` records with explicit roles (`owner`, `admin`, `analyst`, `viewer`).
 
 ### 2.5 Role-Permission Matrix

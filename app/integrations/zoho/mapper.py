@@ -43,13 +43,20 @@ def map_zoho_job_opening(record: dict[str, Any], tenant_id: str, run_id: str) ->
     }
 
 
+from app.analytics.attribution import resolve_application_attribution
+
+
 def map_zoho_application(
     app_record: dict[str, Any],
     candidate_source_map: dict[str, str],
     tenant_id: str,
     run_id: str,
 ) -> dict[str, Any]:
-    """Map Zoho Application / Associated Candidate record to canonical application."""
+    """Map Zoho Application / Associated Candidate record to canonical application.
+
+    Enforces Phase 5 application-first source channel attribution with
+    candidate fallback, confidence scoring, and channel normalization.
+    """
     app_id = str(app_record.get("id") or "")
     cand_obj = app_record.get("Candidate_ID") or {}
     cand_id = cand_obj.get("id") if isinstance(cand_obj, dict) else str(cand_obj)
@@ -57,13 +64,9 @@ def map_zoho_application(
     job_obj = app_record.get("Job_Opening_ID") or {}
     req_id = str(job_obj.get("id") or job_obj) if isinstance(job_obj, dict) else str(job_obj)
 
-    # Resolve source channel: prefer candidate source, then application lead source
-    source = (
-        candidate_source_map.get(cand_id)
-        or app_record.get("Lead_Source")
-        or app_record.get("Source")
-        or "unknown"
-    )
+    # Resolve application-level source with fallback and confidence
+    attrib = resolve_application_attribution(app_record, candidate_source_map)
+    source = attrib["source_channel"]
 
     # Normalize outcome
     status_raw = str(
@@ -93,6 +96,9 @@ def map_zoho_application(
         "application_id": app_id,
         "requisition_id": req_id,
         "source_channel": source,
+        "raw_source": attrib["raw_source"],
+        "attribution_method": attrib["attribution_method"],
+        "attribution_confidence": attrib["attribution_confidence"],
         "applied_at": applied_at,
         "application_outcome": outcome,
         "joined_at": joined_at,
@@ -101,3 +107,4 @@ def map_zoho_application(
         "mapping_version": "zoho_v2",
         "ingest_run_id": run_id,
     }
+

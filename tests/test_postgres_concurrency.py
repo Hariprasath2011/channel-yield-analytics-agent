@@ -368,3 +368,59 @@ def test_postgres_concurrent_oauth_state_claim(
     )
     assert len(integrations) == 1
     assert integrations[0].status == "active"
+
+
+def test_postgres_concurrent_browser_get_callback_claim(
+    pg_session_factory: sessionmaker[Session],
+    pg_db: Session,
+):
+    """Exactly one of two concurrent unauthenticated browser GET callbacks may claim the state without passing tenant_id."""
+    tenant = Tenant(
+        id=f"tenant-browser-{uuid.uuid4().hex[:6]}",
+        slug=f"slug-browser-{uuid.uuid4().hex[:6]}",
+        name="Browser OAuth Claim Tenant",
+    )
+    pg_db.add(tenant)
+    pg_db.commit()
+
+    state = ZohoService.create_oauth_state(pg_db, tenant.id, data_center="com")
+    barrier = threading.Barrier(2)
+
+    def _worker() -> str:
+        client = ZohoRecruitClient(
+            client_id="cid",
+            client_secret="sec",
+            redirect_uri="https://cb.test",
+            data_center="com",
+            http_client=_ConcurrentTokenHttp(),
+        )
+        with pg_session_factory() as session:
+            barrier.wait()
+            try:
+                # Browser callback calls exchange_and_save_tokens with tenant_id=None
+                integration = ZohoService.exchange_and_save_tokens(
+                    session,
+                    state_token=state,
+                    code="valid_auth_code",
+                    client=client,
+                )
+                assert integration.tenant_id == tenant.id
+                return "success"
+            except OAuthError:
+                return "rejected"
+            except Exception as exc:
+                return f"error:{type(exc).__name__}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [f.result() for f in (executor.submit(_worker), executor.submit(_worker))]
+
+    assert sorted(outcomes) == ["rejected", "success"]
+    pg_db.expire_all()
+    row = pg_db.query(OAuthState).filter(OAuthState.state_token == state).one()
+    assert row.used is True
+    integrations = (
+        pg_db.query(ZohoIntegration).filter(ZohoIntegration.tenant_id == tenant.id).all()
+    )
+    assert len(integrations) == 1
+    assert integrations[0].status == "active"
+    assert integrations[0].tenant_id == tenant.id

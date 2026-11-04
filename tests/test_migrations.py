@@ -35,6 +35,15 @@ def test_alembic_migration_lifecycle():
             "sync_jobs",
             "canonical_records",
             "audit_events",
+            "source_channels",
+            "candidates",
+            "job_openings",
+            "applications",
+            "application_stage_events",
+            "recruitment_activities",
+            "recruitment_costs",
+            "sync_logs",
+            "analytics_snapshots",
             "alembic_version",
         }
         assert expected_tables.issubset(tables), f"Missing tables: {expected_tables - tables}"

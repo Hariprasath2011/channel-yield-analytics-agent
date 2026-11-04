@@ -1,0 +1,128 @@
+# Render Blueprint for Channel Yield Analytics Agent — Staging Environment
+#
+# Isolated staging deployment:
+# 1. channel-yield-db-staging (Separate Staging PostgreSQL Database)
+# 2. channel-yield-backend-staging (Staging FastAPI Backend & Analytics)
+# 3. zoho-recruit-mcp-staging (Staging Custom MCP Server for iGentic Staging)
+# 4. channel-yield-sync-worker-staging (Staging Synchronization Cron Job - initially disabled)
+#
+# Target Git Branch: staging
+# All services connect exclusively to channel-yield-db-staging.
+# Production database and credentials are strictly isolated.
+
+databases:
+  - name: channel-yield-db-staging
+    databaseName: channel_yield_staging
+    user: channel_yield_staging_user
+    plan: starter
+    region: oregon
+    postgresMajorVersion: "16"
+
+services:
+  # ── Staging Core REST API & Analytics Service ────────────────────────────────
+  - type: web
+    name: channel-yield-backend-staging
+    runtime: python
+    branch: staging
+    plan: starter
+    region: oregon
+    buildCommand: "pip install -r requirements.txt && alembic upgrade head"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: CY_ENV
+        value: staging
+      - key: CY_DATABASE_URL
+        fromDatabase:
+          name: channel-yield-db-staging
+          property: connectionString
+      - key: CY_SECRET_KEY
+        sync: false
+        # Staging JWT signing secret. Generate via: python -c "import secrets; print(secrets.token_hex(32))"
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+        # Staging Fernet encryption key. Generate via: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+        # Dedicated Staging Zoho Recruit OAuth 2.0 Client ID
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+        # Dedicated Staging Zoho Recruit OAuth 2.0 Client Secret
+      - key: CY_ZOHO_REDIRECT_URI
+        value: "https://channel-yield-backend-staging.onrender.com/v2/integrations/zoho/callback"
+      - key: CY_ZOHO_DATA_CENTER
+        value: com
+      - key: CY_CORS_ORIGINS
+        value: '["https://staging.igentic.ai", "https://app-staging.igentic.ai"]'
+
+  # ── Staging Custom MCP Server for iGentic ─────────────────────────────────────
+  - type: web
+    name: zoho-recruit-mcp-staging
+    runtime: python
+    branch: staging
+    plan: starter
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m mcp_server.server --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: CY_ENV
+        value: staging
+      - key: CY_MCP_HOST
+        value: 0.0.0.0
+      - key: CY_DATABASE_URL
+        fromDatabase:
+          name: channel-yield-db-staging
+          property: connectionString
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+        # Must match staging CY_ENCRYPTION_KEY from channel-yield-backend-staging
+      - key: CY_SECRET_KEY
+        sync: false
+        # Must match staging CY_SECRET_KEY from channel-yield-backend-staging
+      - key: CY_MCP_SECRET_PATH_KEY
+        sync: false
+        # Staging capability-path key for iGentic staging connections (/sse/<key> and /mcp/<key>)
+      - key: CY_MCP_AUTH_TOKEN
+        sync: false
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+        # Same staging Zoho Client ID
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+        # Same staging Zoho Client Secret
+      - key: CY_ZOHO_REDIRECT_URI
+        value: "https://channel-yield-backend-staging.onrender.com/v2/integrations/zoho/callback"
+      - key: CY_ZOHO_DATA_CENTER
+        value: com
+
+  # ── Staging Hourly Synchronization Cron Job (Initially Disabled) ──────────────
+  - type: cron
+    name: channel-yield-sync-worker-staging
+    runtime: python
+    branch: staging
+    plan: starter
+    region: oregon
+    schedule: "0 * * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m app.worker --once"
+    envVars:
+      - key: CY_ENV
+        value: staging
+      - key: CY_SYNC_WORKER_ENABLED
+        value: "false"
+        # INITIALLY DISABLED: Retain as "false" until live Zoho OAuth and manual sync tests pass on staging.
+        # Set to "true" in Render dashboard once verified.
+      - key: CY_DATABASE_URL
+        fromDatabase:
+          name: channel-yield-db-staging
+          property: connectionString
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+        # Same staging Fernet encryption key
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+      - key: CY_ZOHO_REDIRECT_URI
+        value: "https://channel-yield-backend-staging.onrender.com/v2/integrations/zoho/callback"

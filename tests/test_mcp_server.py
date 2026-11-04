@@ -84,13 +84,30 @@ def test_mcp_tools_list():
 
     tools = resp["result"]["tools"]
     tool_names = [t["name"] for t in tools]
-    assert "list_job_openings" in tool_names
-    assert "list_candidates" in tool_names
-    assert "list_applications" in tool_names
-    assert "check_zoho_connection" in tool_names
-    assert "connect_zoho_account" in tool_names
-    assert "compute_channel_yield" in tool_names
-    assert len(tools) == 6
+    required_tools = [
+        "test_zoho_connection",
+        "check_zoho_connection",
+        "connect_zoho_account",
+        "get_recruitment_modules",
+        "get_recruitment_fields",
+        "get_sync_status",
+        "list_job_openings",
+        "list_candidates",
+        "list_applications",
+        "get_candidate_details",
+        "get_application_details",
+        "get_selection_history",
+        "get_candidate_history",
+        "get_recruitment_funnel",
+        "compute_channel_yield",
+        "get_channel_conversion",
+        "get_channel_costs",
+        "get_channel_recommendations",
+    ]
+    for r_tool in required_tools:
+        assert r_tool in tool_names, f"Missing tool: {r_tool}"
+    assert len(tools) == 18
+
 
 
 # ─── 2. Tool 1: list_job_openings ─────────────────────────────────────────────
@@ -1066,6 +1083,166 @@ def test_reusing_pending_oauth_state_avoids_competing_states(db_session):
     assert url1 == url2
 
 
+def test_connect_zoho_account_data_center_fallback_chain(db_session, monkeypatch):
+    """Verify data center fallback: explicit arg > configured setting > final default 'com'."""
+    from types import SimpleNamespace
+    import mcp_server.zoho_recruit as zr_mod
+
+    def _mock_settings(zoho_dc=""):
+        return SimpleNamespace(
+            zoho_client_id="test-client-id",
+            zoho_client_secret="test-client-secret",
+            zoho_redirect_uri="https://app.example/v2/integrations/zoho/callback",
+            zoho_data_center=zoho_dc,
+        )
+
+    # 1. No explicit argument and no configured setting -> defaults to 'com'
+    monkeypatch.setattr(zr_mod, "get_settings", lambda: _mock_settings(zoho_dc=""))
+    handler_unconf = ZohoRecruitMCPHandler()
+    res_default = handler_unconf.connect_zoho_account()
+    assert res_default["status"] == "requires_authorization"
+    assert "https://accounts.zoho.com/oauth/v2/auth" in res_default["authorization_url"]
+
+    # 2. Configured setting 'eu' with no explicit argument -> uses EU domain
+    monkeypatch.setattr(zr_mod, "get_settings", lambda: _mock_settings(zoho_dc="eu"))
+    handler_eu_cfg = ZohoRecruitMCPHandler()
+    res_eu_cfg = handler_eu_cfg.connect_zoho_account()
+    assert "https://accounts.zoho.eu/oauth/v2/auth" in res_eu_cfg["authorization_url"]
+
+    # 3. Explicit argument 'in' overrides configured setting 'eu' -> uses India domain
+    res_in_explicit = handler_eu_cfg.connect_zoho_account(data_center="in")
+    assert "https://accounts.zoho.in/oauth/v2/auth" in res_in_explicit["authorization_url"]
+
+    # 4. Explicit argument 'eu' when configured setting is 'com' -> uses EU domain
+    monkeypatch.setattr(zr_mod, "get_settings", lambda: _mock_settings(zoho_dc="com"))
+    handler_com_cfg = ZohoRecruitMCPHandler()
+    res_eu_explicit = handler_com_cfg.connect_zoho_account(data_center="eu")
+    assert "https://accounts.zoho.eu/oauth/v2/auth" in res_eu_explicit["authorization_url"]
+
+    # 5. Explicit canonical 'au' -> uses Australia domain accounts.zoho.com.au
+    res_au = handler_com_cfg.connect_zoho_account(data_center="au")
+    assert res_au["status"] == "requires_authorization"
+    assert "https://accounts.zoho.com.au/oauth/v2/auth" in res_au["authorization_url"]
+
+    # 6. Explicit compatibility alias 'com.au' -> normalizes to 'au' and uses Australia domain
+    res_com_au = handler_com_cfg.connect_zoho_account(data_center="com.au")
+    assert res_com_au["status"] == "requires_authorization"
+    assert "https://accounts.zoho.com.au/oauth/v2/auth" in res_com_au["authorization_url"]
+
+    # 7. Explicit unsupported values ('mars', 'aus') return structured error rather than falling back
+    res_mars = handler_com_cfg.connect_zoho_account(data_center="mars")
+    assert res_mars["status"] == "error"
+    assert res_mars["error"] == "invalid_data_center"
+    assert "Unsupported Zoho data center: 'mars'" in res_mars["message"]
+    assert "com.au" in res_mars["message"]
+
+    res_aus = handler_com_cfg.connect_zoho_account(data_center="aus")
+    assert res_aus["status"] == "error"
+    assert res_aus["error"] == "invalid_data_center"
+    assert "Unsupported Zoho data center: 'aus'" in res_aus["message"]
+
+    res_check_mars = handler_com_cfg.check_zoho_connection(data_center="mars")
+    assert res_check_mars["status"] == "error"
+    assert res_check_mars["error"] == "invalid_data_center"
+
+    # 8. Explicit empty or whitespace-only value is treated as omitted -> falls back to 'com'
+    res_ws = handler_com_cfg.connect_zoho_account(data_center="   ")
+    assert res_ws["status"] == "requires_authorization"
+    assert "https://accounts.zoho.com/oauth/v2/auth" in res_ws["authorization_url"]
+
+
+def test_get_or_create_auth_url_invalid_data_center_raises_validation_error(db_session):
+    """Verify _get_or_create_auth_url raises ValidationError directly when called with invalid region."""
+    handler = ZohoRecruitMCPHandler(tenant_id="test-tenant")
+    with pytest.raises(ValidationError, match="Unsupported Zoho data center: 'mars'"):
+        handler._get_or_create_auth_url(db_session, tenant_id="test-tenant", data_center="mars")
+
+    with pytest.raises(ValidationError, match="Unsupported Zoho data center: 'aus'"):
+        handler._get_or_create_auth_url(db_session, tenant_id="test-tenant", data_center="aus")
+
+
+def test_mcp_dispatcher_connect_zoho_account_data_center_dispatching(db_session, monkeypatch):
+    """Verify MCPServerDispatcher correctly propagates or omits data_center without hardcoded overrides."""
+    from types import SimpleNamespace
+    import mcp_server.zoho_recruit as zr_mod
+    from mcp_server.server import MCP_TOOLS
+
+    # Verify MCP_TOOLS schema default, enums, and description mentioning com.au alias
+    connect_tool = next(t for t in MCP_TOOLS if t["name"] == "connect_zoho_account")
+    dc_prop = connect_tool["inputSchema"]["properties"]["data_center"]
+    assert dc_prop["default"] == "com"
+    assert dc_prop["enum"] == ["com", "eu", "in", "au", "jp", "ca"]
+    assert "com.au" in dc_prop["description"]
+
+    check_tool = next(t for t in MCP_TOOLS if t["name"] == "check_zoho_connection")
+    check_dc_prop = check_tool["inputSchema"]["properties"]["data_center"]
+    assert check_dc_prop["enum"] == ["com", "eu", "in", "au", "jp", "ca"]
+    assert "com.au" in check_dc_prop["description"]
+
+    def _mock_settings(zoho_dc=""):
+        return SimpleNamespace(
+            zoho_client_id="test-client-id",
+            zoho_client_secret="test-client-secret",
+            zoho_redirect_uri="https://app.example/v2/integrations/zoho/callback",
+            zoho_data_center=zoho_dc,
+        )
+
+    # Dispatcher call with no data_center in arguments -> falls back to 'com'
+    monkeypatch.setattr(zr_mod, "get_settings", lambda: _mock_settings(zoho_dc=""))
+    dispatcher = MCPServerDispatcher(handler=ZohoRecruitMCPHandler())
+
+    call_req_no_arg = {
+        "jsonrpc": "2.0",
+        "id": "1",
+        "method": "tools/call",
+        "params": {"name": "connect_zoho_account", "arguments": {}},
+    }
+    resp1 = dispatcher.dispatch(call_req_no_arg)
+    assert "accounts.zoho.com" in json.dumps(resp1)
+
+    # Dispatcher call with explicit data_center='in' -> uses India domain
+    call_req_in = {
+        "jsonrpc": "2.0",
+        "id": "2",
+        "method": "tools/call",
+        "params": {"name": "connect_zoho_account", "arguments": {"data_center": "in"}},
+    }
+    resp2 = dispatcher.dispatch(call_req_in)
+    assert "accounts.zoho.in" in json.dumps(resp2)
+
+    # Dispatcher call with explicit data_center='eu' -> uses EU domain
+    call_req_eu = {
+        "jsonrpc": "2.0",
+        "id": "3",
+        "method": "tools/call",
+        "params": {"name": "connect_zoho_account", "arguments": {"data_center": "eu"}},
+    }
+    resp3 = dispatcher.dispatch(call_req_eu)
+    assert "accounts.zoho.eu" in json.dumps(resp3)
+
+    # Dispatcher call with explicit alias data_center='com.au' -> uses Australia domain
+    call_req_com_au = {
+        "jsonrpc": "2.0",
+        "id": "4",
+        "method": "tools/call",
+        "params": {"name": "connect_zoho_account", "arguments": {"data_center": "com.au"}},
+    }
+    resp4 = dispatcher.dispatch(call_req_com_au)
+    assert "accounts.zoho.com.au" in json.dumps(resp4)
+
+    # Dispatcher call with invalid explicit data_center='mars' -> returns structured error with isError True
+    call_req_invalid = {
+        "jsonrpc": "2.0",
+        "id": "5",
+        "method": "tools/call",
+        "params": {"name": "connect_zoho_account", "arguments": {"data_center": "mars"}},
+    }
+    resp5 = dispatcher.dispatch(call_req_invalid)
+    assert resp5["result"]["isError"] is True
+    assert "invalid_data_center" in json.dumps(resp5)
+    assert "com.au" in json.dumps(resp5)
+
+
 def test_safe_db_error_metadata_sanitization():
     """Verify _safe_db_error_metadata extracts only safe metadata and normalizes SQLSTATEs."""
     class MockDriverError(Exception):
@@ -1246,6 +1423,7 @@ def test_standard_stream_logging_emits_sanitized_fields_without_leaks(monkeypatc
     underlying_logger.addHandler(handler)
     prev_level = underlying_logger.level
     underlying_logger.setLevel(logging.INFO)
+    underlying_logger.disabled = False
 
     try:
         mcp_handler = zr_mod.ZohoRecruitMCPHandler()

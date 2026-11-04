@@ -1,17 +1,95 @@
+# Render Blueprint for Channel Yield Analytics Agent
+# Production multi-service configuration:
+# 1. channel-yield-backend (Core REST API, OAuth, ingestion, and analytics engine)
+# 2. zoho-recruit-mcp (Custom MCP Server for iGentic AI integration)
+# 3. channel-yield-sync-worker (Scheduled hourly synchronization cron worker)
+
 services:
+  # ── Core REST API & Analytics Service ──────────────────────────────────────────
   - type: web
-    name: channel-yield-analytics-demo
+    name: channel-yield-analytics-agent
     runtime: python
-    plan: free
-    buildCommand: "python -m py_compile analytics_api.py analytics_service.py csv_ingestion_pipeline.py semantic_validator.py"
-    startCommand: "python csv_ingestion_pipeline.py --config ingestion_config_demo.json --db demo_ingestion.sqlite && python analytics_api.py --host 0.0.0.0 --port $PORT"
+    plan: starter
+    region: oregon
+    buildCommand: "pip install -r requirements.txt && alembic upgrade head"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     healthCheckPath: /health
     envVars:
-      - key: CY_API_HOST
+      - key: CY_ENV
+        value: production
+      - key: CY_DATABASE_URL
+        sync: false
+      - key: CY_SECRET_KEY
+        sync: false
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+      - key: CY_ZOHO_REDIRECT_URI
+        sync: false
+      - key: CY_ZOHO_DATA_CENTER
+        value: com
+      - key: CY_CORS_ORIGINS
+        value: '["https://igentic.ai", "https://app.igentic.ai"]'
+
+  # ── Custom MCP Server for iGentic ─────────────────────────────────────────────
+  - type: web
+    name: zoho-recruit-mcp
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m mcp_server.server --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /health
+    envVars:
+      - key: CY_ENV
+        value: production
+      - key: CY_MCP_HOST
         value: 0.0.0.0
-      - key: CY_CLIENT_ID
-        value: demo_client
-      - key: CY_DB_PATH
-        value: demo_ingestion.sqlite
-      - key: CY_API_TOKEN
+      - key: CY_DATABASE_URL
+        sync: false
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+      - key: CY_MCP_TENANT_ID
+        sync: false
+      - key: CY_MCP_SECRET_PATH_KEY
+        sync: false
+      - key: CY_MCP_AUTH_TOKEN
+        sync: false
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+      - key: CY_ZOHO_REDIRECT_URI
+        sync: false
+      - key: CY_ZOHO_DATA_CENTER
+        value: com
+
+  # ── Scheduled Hourly Synchronization Worker ───────────────────────────────────
+  - type: cron
+    name: channel-yield-sync-worker
+    runtime: python
+    plan: starter
+    region: oregon
+    schedule: "0 * * * *"
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m app.worker --once"
+    envVars:
+      - key: CY_ENV
+        value: production
+      - key: CY_SYNC_WORKER_ENABLED
+        value: "false"
+        # SAFETY LOCK: Initially disabled until live Zoho authorization and manual sync tests pass.
+        # Change to "true" in Render dashboard once verified.
+      - key: CY_DATABASE_URL
+        sync: false
+      - key: CY_ENCRYPTION_KEY
+        sync: false
+      - key: CY_ZOHO_CLIENT_ID
+        sync: false
+      - key: CY_ZOHO_CLIENT_SECRET
+        sync: false
+      - key: CY_ZOHO_REDIRECT_URI
         sync: false
