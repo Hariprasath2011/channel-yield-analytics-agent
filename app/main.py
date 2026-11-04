@@ -315,10 +315,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from app.auth.router import router as auth_router
     from app.analytics.router import router as analytics_router
     from app.agent.router import router as agent_router
+    from app.admin.router import router as admin_router
 
     app.include_router(auth_router)
     app.include_router(analytics_router)
     app.include_router(agent_router)
+    app.include_router(admin_router)
 
     # ── Ingestion & Integration Routers ──
     from app.ingestion.router import router as ingestion_router

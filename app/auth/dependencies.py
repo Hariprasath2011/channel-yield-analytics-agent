@@ -202,6 +202,23 @@ def require_role(minimum_role: str):
     return _check
 
 
+def require_admin_jwt(
+    ctx: AuthenticatedContext = Depends(get_current_user),
+) -> AuthenticatedContext:
+    """Enforce that the caller is authenticated via a verified human JWT with admin or owner role.
+
+    Strictly rejects:
+    - Missing or unauthenticated requests (HTTP 401)
+    - Invalid, malformed, or expired JWT tokens (HTTP 401)
+    - Machine API keys / synthetic credentials (HTTP 401)
+    - Non-admin users (viewer, analyst) (HTTP 403)
+    """
+    user_level = _ROLE_ORDER.get(ctx.role, -1)
+    if user_level < _ROLE_ORDER["admin"]:
+        raise http_403("This action requires administrator privileges.")
+    return ctx
+
+
 def verify_legacy_token(authorization: str) -> bool:
     """Constant-time comparison of the legacy bearer token for prototype compat."""
     settings = get_settings()
