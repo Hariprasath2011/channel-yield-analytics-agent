@@ -9,10 +9,16 @@ Implements official Zoho Recruit API v2 and OAuth 2.0 flows:
 """
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 import httpx
 
-from app.core.exceptions import IntegrationError, OAuthError, RateLimitError
+from app.core.exceptions import (
+    IntegrationError,
+    OAuthError,
+    OAuthScopeError,
+    RateLimitError,
+)
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -31,11 +37,92 @@ DEFAULT_SCOPES = [
     "ZohoRecruit.modules.jobopening.READ",
     "ZohoRecruit.modules.candidate.READ",
     "ZohoRecruit.modules.application.READ",
+    "ZohoRecruit.settings.modules.read",
+    "ZohoRecruit.settings.fields.read",
 ]
+
+MAX_RETRY_AFTER_SECONDS: int = 300
+DEFAULT_RETRY_AFTER_SECONDS: int = 60
+
+
+def parse_retry_after(
+    raw_val: Any,
+    max_delay: int = MAX_RETRY_AFTER_SECONDS,
+    default_delay: int = DEFAULT_RETRY_AFTER_SECONDS,
+) -> int:
+    """Defensively parse the Retry-After header.
+
+    HTTP RFC 9110 specifies delay-seconds as a non-negative decimal integer.
+    Rejects:
+    - Missing (None, empty, whitespace)
+    - Decimal / non-integer values (e.g. 45.5, "45.5")
+    - Non-finite / NaN / Infinity
+    - Negative and zero values (<= 0)
+    - Malformed strings
+
+    Bounds:
+    - Default to default_delay (60s) on invalid/rejected values
+    - Cap at max_delay (300s) on excessively large values
+    """
+    if raw_val is None or isinstance(raw_val, bool):
+        return default_delay
+
+    val: Optional[int] = None
+
+    if isinstance(raw_val, int):
+        val = raw_val
+    elif isinstance(raw_val, str):
+        s = raw_val.strip()
+        if s.startswith("-"):
+            if s[1:].isdigit():
+                val = -int(s[1:])
+            else:
+                return default_delay
+        elif s.isdigit():
+            val = int(s)
+        else:
+            return default_delay
+    elif isinstance(raw_val, float):
+        if not math.isfinite(raw_val) or not raw_val.is_integer():
+            return default_delay
+        val = int(raw_val)
+    else:
+        return default_delay
+
+    if val is None or val <= 0:
+        return default_delay
+    if val > max_delay:
+        return max_delay
+    return val
+
+
+def _sanitize_error_code(raw_code: Any) -> str:
+    """Sanitize error code for safe logging (alphanumeric, underscore, hyphen only, max 32 chars)."""
+    if not raw_code:
+        return "UNKNOWN"
+    clean = "".join(c for c in str(raw_code) if c.isalnum() or c in ("_", "-"))[:32]
+    return clean or "UNKNOWN"
+
+
+def _extract_correlation_id(resp: httpx.Response) -> Optional[str]:
+    """Extract and sanitize correlation/request identifier from response headers."""
+    raw_id = (
+        resp.headers.get("x-request-id")
+        or resp.headers.get("X-Request-Id")
+        or resp.headers.get("x-correlation-id")
+        or resp.headers.get("X-Correlation-Id")
+        or resp.headers.get("z-request-id")
+    )
+    if not raw_id:
+        return None
+    clean_id = "".join(c for c in str(raw_id) if c.isalnum() or c in ("-", "_"))[:64]
+    return clean_id or None
 
 
 class ZohoRecruitClient:
     """Client for Zoho Recruit REST API v2."""
+
+    parse_retry_after = staticmethod(parse_retry_after)
 
     def __init__(
         self,
@@ -65,6 +152,122 @@ class ZohoRecruitClient:
         self.accounts_url = DATACENTER_DOMAINS[dc]["accounts"]
         self.api_url = DATACENTER_DOMAINS[dc]["api"]
 
+    def _classify_error_response(
+        self,
+        resp: httpx.Response,
+        action_description: str,
+        log_tag: Optional[str] = None,
+    ) -> None:
+        """Defensively parse and classify Zoho API HTTP errors without leaking secrets."""
+        if resp.status_code < 400:
+            return
+
+        tag = log_tag or "api"
+        corr_id = _extract_correlation_id(resp)
+
+        # 1. Rate Limiting (HTTP 429)
+        if resp.status_code == 429:
+            retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+            logger.warning(
+                f"zoho.{tag}_rate_limited",
+                status_code=429,
+                retry_after=retry_after,
+                correlation_id=corr_id,
+            )
+            raise RateLimitError(
+                "zoho_recruit",
+                retry_after=retry_after,
+                message=f"Zoho API rate limit reached. Retry after {retry_after}s.",
+            )
+
+        # 2. Defensive JSON parsing
+        payload: dict[str, Any] = {}
+        try:
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                payload = parsed
+            elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                payload = parsed[0]
+        except Exception:
+            payload = {}
+
+        raw_code = payload.get("code") or payload.get("error")
+        raw_msg = payload.get("message") or payload.get("error_description")
+
+        error_code = str(raw_code).strip().upper() if raw_code else ""
+        error_msg = str(raw_msg).strip() if raw_msg else ""
+
+        # Safe error code for logging: strictly alphanumeric + underscores, capped at 32 chars
+        safe_code = _sanitize_error_code(error_code)
+
+        code_lower = error_code.lower()
+        msg_lower = error_msg.lower()
+
+        # Explicit scope denial evidence: "scope" explicitly present in code or message
+        has_explicit_scope_evidence = (
+            "scope" in code_lower
+            or "scope" in msg_lower
+            or error_code in ("OAUTH_SCOPE_MISMATCH", "INSUFFICIENT_SCOPE")
+        )
+
+        if has_explicit_scope_evidence:
+            logger.warning(
+                f"zoho.{tag}_scope_denied",
+                status_code=resp.status_code,
+                error_code=safe_code,
+                correlation_id=corr_id,
+            )
+            raise OAuthScopeError(
+                "Zoho API access denied: missing or insufficient OAuth scope. Re-authorization is required.",
+                provider="zoho_recruit",
+            )
+
+        # 3. HTTP 401 Unauthorized handling
+        if resp.status_code == 401:
+            # Check for explicit token invalidation or expiration evidence
+            is_explicit_token_error = (
+                error_code in ("EXPIRED_TOKEN", "TOKEN_EXPIRED")
+                or any(phrase in msg_lower for phrase in ("invalid oauth token", "invalid token", "token has expired", "token expired", "expired token"))
+                or (error_code in ("INVALID_TOKEN", "AUTHENTICATION_FAILURE") and any(term in msg_lower for term in ("invalid", "expired", "token")))
+            )
+
+            if is_explicit_token_error:
+                logger.warning(
+                    f"zoho.{tag}_token_invalid_or_expired",
+                    status_code=401,
+                    error_code=safe_code,
+                    correlation_id=corr_id,
+                )
+                raise OAuthError("Zoho access token is invalid or expired.", provider="zoho_recruit")
+
+            # Ambiguous 401 response (generic, non-JSON, or unspecified error)
+            logger.warning(
+                f"zoho.{tag}_unauthorized_ambiguous",
+                status_code=401,
+                error_code=safe_code,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho authentication failed (HTTP 401).", provider="zoho_recruit")
+
+        # 4. HTTP 403 Forbidden (non-scope)
+        if resp.status_code == 403:
+            logger.error(
+                f"zoho.{tag}_forbidden",
+                status_code=403,
+                error_code=safe_code,
+                correlation_id=corr_id,
+            )
+            raise IntegrationError("zoho_recruit", f"Failed to {action_description}: HTTP 403 Forbidden.")
+
+        # 5. Other HTTP >= 400 errors
+        logger.error(
+            f"zoho.{tag}_failed",
+            status_code=resp.status_code,
+            error_code=safe_code,
+            correlation_id=corr_id,
+        )
+        raise IntegrationError("zoho_recruit", f"Failed to {action_description}: HTTP {resp.status_code}.")
+
     def get_authorization_url(self, state: str, scopes: Optional[list[str]] = None) -> str:
         """Construct the OAuth authorization redirect URL."""
         scope_str = ",".join(scopes or DEFAULT_SCOPES)
@@ -93,30 +296,60 @@ class ZohoRecruitClient:
         try:
             resp = self._http.post(url, data=data)
         except httpx.TimeoutException as exc:
-            logger.error("zoho.oauth_token_exchange_timeout", error=str(exc))
-            raise IntegrationError("zoho_recruit", "Connection timed out exchanging authorization code.")
+            logger.error("zoho.oauth_token_exchange_timeout", error_type=exc.__class__.__name__)
+            raise IntegrationError("zoho_recruit", "Zoho token exchange failed due to a network error.") from exc
         except httpx.RequestError as exc:
-            logger.error("zoho.oauth_token_exchange_network_error", error=str(exc))
-            raise IntegrationError("zoho_recruit", f"Network error during token exchange: {exc}")
+            logger.error("zoho.oauth_token_exchange_network_error", error_type=exc.__class__.__name__)
+            raise IntegrationError("zoho_recruit", "Zoho token exchange failed due to a network error.") from exc
+
+        corr_id = _extract_correlation_id(resp)
 
         if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho OAuth rate limit reached.")
+            retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+            logger.warning(
+                "zoho.oauth_token_exchange_rate_limited",
+                status_code=429,
+                retry_after=retry_after,
+                correlation_id=corr_id,
+            )
+            raise RateLimitError(
+                "zoho_recruit",
+                retry_after=retry_after,
+                message=f"Zoho OAuth rate limit reached. Retry after {retry_after}s.",
+            )
         try:
             payload = resp.json()
         except ValueError as exc:
-            logger.error("zoho.oauth_token_exchange_invalid_json")
-            raise OAuthError("Zoho token exchange returned an invalid response.") from exc
+            logger.error(
+                "zoho.oauth_token_exchange_invalid_json",
+                status_code=resp.status_code,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho token exchange failed.", provider="zoho_recruit") from exc
         if not isinstance(payload, dict):
-            logger.error("zoho.oauth_token_exchange_invalid_payload")
-            raise OAuthError("Zoho token exchange returned an invalid response.")
+            logger.error(
+                "zoho.oauth_token_exchange_invalid_payload",
+                status_code=resp.status_code,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho token exchange failed.", provider="zoho_recruit")
         if "error" in payload or resp.status_code >= 400:
-            err = payload.get("error", "token_exchange_failed")
-            logger.error("zoho.oauth_token_exchange_failed", error=err)
-            raise OAuthError(f"Zoho token exchange failed: {err}")
+            safe_err = _sanitize_error_code(payload.get("error"))
+            logger.error(
+                "zoho.oauth_token_exchange_failed",
+                status_code=resp.status_code,
+                error_code=safe_err,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho token exchange failed.", provider="zoho_recruit")
         access_token = payload.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
-            logger.error("zoho.oauth_token_exchange_missing_access_token")
-            raise OAuthError("Zoho token response is missing a valid access_token.")
+            logger.error(
+                "zoho.oauth_token_exchange_missing_access_token",
+                status_code=resp.status_code,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho token exchange failed.", provider="zoho_recruit")
         return payload
 
     def refresh_access_token(self, refresh_token: str) -> dict[str, Any]:
@@ -131,19 +364,52 @@ class ZohoRecruitClient:
         try:
             resp = self._http.post(url, data=data)
         except httpx.TimeoutException as exc:
-            logger.error("zoho.oauth_token_refresh_timeout", error=str(exc))
-            raise IntegrationError("zoho_recruit", "Connection timed out refreshing access token.")
+            logger.error("zoho.oauth_token_refresh_timeout", error_type=exc.__class__.__name__)
+            raise IntegrationError("zoho_recruit", "Zoho token refresh failed due to a network error.") from exc
         except httpx.RequestError as exc:
-            logger.error("zoho.oauth_token_refresh_network_error", error=str(exc))
-            raise IntegrationError("zoho_recruit", f"Network error during token refresh: {exc}")
+            logger.error("zoho.oauth_token_refresh_network_error", error_type=exc.__class__.__name__)
+            raise IntegrationError("zoho_recruit", "Zoho token refresh failed due to a network error.") from exc
+
+        corr_id = _extract_correlation_id(resp)
 
         if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho OAuth rate limit reached.")
-        payload = resp.json()
+            retry_after = parse_retry_after(resp.headers.get("Retry-After"))
+            logger.warning(
+                "zoho.oauth_token_refresh_rate_limited",
+                status_code=429,
+                retry_after=retry_after,
+                correlation_id=corr_id,
+            )
+            raise RateLimitError(
+                "zoho_recruit",
+                retry_after=retry_after,
+                message=f"Zoho OAuth rate limit reached. Retry after {retry_after}s.",
+            )
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            logger.error(
+                "zoho.oauth_token_refresh_invalid_json",
+                status_code=resp.status_code,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho token refresh failed.", provider="zoho_recruit") from exc
+        if not isinstance(payload, dict):
+            logger.error(
+                "zoho.oauth_token_refresh_invalid_payload",
+                status_code=resp.status_code,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho token refresh failed.", provider="zoho_recruit")
         if "error" in payload or resp.status_code >= 400:
-            err = payload.get("error", "token_refresh_failed")
-            logger.error("zoho.oauth_token_refresh_failed", error=err)
-            raise OAuthError(f"Zoho token refresh failed: {err}")
+            safe_err = _sanitize_error_code(payload.get("error"))
+            logger.error(
+                "zoho.oauth_token_refresh_failed",
+                status_code=resp.status_code,
+                error_code=safe_err,
+                correlation_id=corr_id,
+            )
+            raise OAuthError("Zoho token refresh failed.", provider="zoho_recruit")
         return payload
 
     def get_module_records(
@@ -167,25 +433,11 @@ class ZohoRecruitClient:
             logger.error("zoho.fetch_module_network_error", module=module, error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching {module}: {exc}")
 
-        if resp.status_code == 429:
-            retry_header = resp.headers.get("Retry-After", "60")
-            try:
-                retry_after = int(retry_header)
-            except ValueError:
-                retry_after = 60
-            raise RateLimitError("zoho_recruit", retry_after=retry_after, message=f"Zoho API rate limit reached. Retry after {retry_after}s.")
-
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
-
         # Zoho returns HTTP 204 No Content when a module contains 0 records
         if resp.status_code == 204:
             return {"data": [], "info": {"page": page, "per_page": min(per_page, 200), "more_records": False}}
 
-        if resp.status_code >= 400:
-            logger.error("zoho.fetch_module_failed", module=module, status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch {module}: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"fetch {module}", log_tag="fetch_module")
         return resp.json()
 
     def fetch_all_module_records(
@@ -231,24 +483,10 @@ class ZohoRecruitClient:
             logger.error("zoho.get_record_network_error", module=module, record_id=clean_id, error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching {module} {clean_id}: {exc}")
 
-        if resp.status_code == 429:
-            retry_header = resp.headers.get("Retry-After", "60")
-            try:
-                retry_after = int(retry_header)
-            except ValueError:
-                retry_after = 60
-            raise RateLimitError("zoho_recruit", retry_after=retry_after, message=f"Zoho API rate limit reached.")
-
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
-
         if resp.status_code == 404:
             return {"data": [], "status": "not_found"}
 
-        if resp.status_code >= 400:
-            logger.error("zoho.get_record_failed", module=module, record_id=clean_id, status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch {module} {clean_id}: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"fetch {module} {clean_id}", log_tag="get_record")
         return resp.json()
 
     # ── Search Capability ─────────────────────────────────────────────────────
@@ -287,25 +525,11 @@ class ZohoRecruitClient:
             logger.error("zoho.search_network_error", module=module, error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error searching {module}: {exc}")
 
-        if resp.status_code == 429:
-            retry_header = resp.headers.get("Retry-After", "60")
-            try:
-                retry_after = int(retry_header)
-            except ValueError:
-                retry_after = 60
-            raise RateLimitError("zoho_recruit", retry_after=retry_after, message=f"Zoho API rate limit reached.")
-
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
-
         # Zoho search returns HTTP 204 No Content when no records match criteria
         if resp.status_code == 204:
             return {"data": [], "info": {"page": page, "more_records": False}}
 
-        if resp.status_code >= 400:
-            logger.error("zoho.search_failed", module=module, status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to search {module}: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"search {module}", log_tag="search")
         return resp.json()
 
     # ── Convenience Typed Domain Methods ──────────────────────────────────────
@@ -434,14 +658,7 @@ class ZohoRecruitClient:
             logger.error("zoho.get_modules_network_error", error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching module metadata: {exc}")
 
-        if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho API rate limit reached.")
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
-        if resp.status_code >= 400:
-            logger.error("zoho.get_modules_failed", status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch module metadata: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"fetch module metadata for '{clean_module or 'all'}'", log_tag="get_modules")
         return resp.json()
 
     def get_module_fields(
@@ -464,14 +681,7 @@ class ZohoRecruitClient:
             logger.error("zoho.get_fields_network_error", module=clean_module, error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching fields for {clean_module}: {exc}")
 
-        if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho API rate limit reached.")
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
-        if resp.status_code >= 400:
-            logger.error("zoho.get_fields_failed", module=clean_module, status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch fields for {clean_module}: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"fetch fields for {clean_module}", log_tag="get_fields")
         return resp.json()
 
     # ── Hiring Pipeline & Transition History (Phase 3 Core) ───────────────────
@@ -498,16 +708,9 @@ class ZohoRecruitClient:
             logger.error("zoho.get_pipeline_network_error", error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching hiring pipeline: {exc}")
 
-        if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho API rate limit reached.")
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
         if resp.status_code == 404:
             return {"data": [], "status": "not_found"}
-        if resp.status_code >= 400:
-            logger.error("zoho.get_pipeline_failed", status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch hiring pipeline: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, "fetch hiring pipeline", log_tag="get_pipeline")
         return resp.json()
 
     def get_application_hiring_pipeline(
@@ -529,16 +732,9 @@ class ZohoRecruitClient:
             logger.error("zoho.get_app_pipeline_network_error", application_id=clean_app_id, error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching pipeline for application {clean_app_id}: {exc}")
 
-        if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho API rate limit reached.")
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
         if resp.status_code == 404:
             return {"data": [], "status": "not_found"}
-        if resp.status_code >= 400:
-            logger.error("zoho.get_app_pipeline_failed", application_id=clean_app_id, status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch pipeline for application {clean_app_id}: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"fetch pipeline for application {clean_app_id}", log_tag="get_app_pipeline")
         return resp.json()
 
     def get_application_transition_details(
@@ -569,16 +765,9 @@ class ZohoRecruitClient:
             logger.error("zoho.get_transitions_network_error", application_id=clean_app_id, error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching stage history for application {clean_app_id}: {exc}")
 
-        if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho API rate limit reached.")
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
         if resp.status_code == 404:
             return {"data": [], "status": "history_unavailable"}
-        if resp.status_code >= 400:
-            logger.error("zoho.get_transitions_failed", application_id=clean_app_id, status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch stage transitions for application {clean_app_id}: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"fetch stage transitions for application {clean_app_id}", log_tag="get_transitions")
         return resp.json()
 
     def get_record_timeline(
@@ -606,14 +795,7 @@ class ZohoRecruitClient:
             logger.error("zoho.get_timeline_network_error", module=clean_mod, record_id=clean_id, error=str(exc))
             raise IntegrationError("zoho_recruit", f"Network error fetching timeline for {clean_mod} {clean_id}: {exc}")
 
-        if resp.status_code == 429:
-            raise RateLimitError("zoho_recruit", message="Zoho API rate limit reached.")
-        if resp.status_code == 401:
-            raise OAuthError("Zoho access token is invalid or expired.")
         if resp.status_code == 404:
             return {"data": [], "status": "timeline_unavailable"}
-        if resp.status_code >= 400:
-            logger.error("zoho.get_timeline_failed", module=clean_mod, record_id=clean_id, status_code=resp.status_code)
-            raise IntegrationError("zoho_recruit", f"Failed to fetch timeline for {clean_mod} {clean_id}: HTTP {resp.status_code}")
-
+        self._classify_error_response(resp, f"fetch timeline for {clean_mod} {clean_id}", log_tag="get_timeline")
         return resp.json()

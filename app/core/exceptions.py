@@ -103,6 +103,19 @@ class OAuthError(ChannelYieldError):
         self.provider = provider
 
 
+class OAuthScopeError(OAuthError):
+    """OAuth access token lacks required scopes or permissions."""
+
+    def __init__(
+        self,
+        message: str = "Zoho access token lacks the required OAuth scope.",
+        *,
+        provider: str = "zoho_recruit",
+    ) -> None:
+        super().__init__(message, provider=provider)
+        self.code = "oauth_scope_denied"
+
+
 class RateLimitError(ChannelYieldError):
     """Rate limit encountered."""
 

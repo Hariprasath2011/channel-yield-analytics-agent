@@ -231,8 +231,10 @@ def test_authorization_url_scopes_use_official_singular_names():
         "ZohoRecruit.modules.jobopening.READ",
         "ZohoRecruit.modules.candidate.READ",
         "ZohoRecruit.modules.application.READ",
+        "ZohoRecruit.settings.modules.read",
+        "ZohoRecruit.settings.fields.read",
     ]
-    # Exact three expected read-only scopes are present, in order
+    # Exact five expected read-only scopes are present, in order
     assert requested_scopes == expected_scopes
     assert DEFAULT_SCOPES == expected_scopes
 
