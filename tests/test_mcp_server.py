@@ -249,6 +249,105 @@ def test_list_applications_filtering(mcp_tenant, monkeypatch):
     assert res["applications"][0]["status"] == "Interview Scheduled"
 
 
+def test_list_applications_empty_204_dataset(mcp_tenant, monkeypatch):
+    """Verify that an HTTP 204 empty response converts to an empty list without error."""
+    handler = ZohoRecruitMCPHandler(tenant_id=mcp_tenant.id)
+    # Simulate Zoho client returning empty data from an HTTP 204 response
+    monkeypatch.setattr(handler, "_fetch_records", lambda mod, page, per_page: {
+        "data": [],
+        "info": {"page": page, "per_page": per_page, "more_records": False},
+    })
+
+    res = handler.list_applications(page=1, per_page=10)
+    assert res["module"] == "Applications"
+    assert res["count"] == 0
+    assert res["has_more"] is False
+    assert res["applications"] == []
+    assert "error" not in res
+
+
+def test_mcp_dispatcher_list_applications_empty_iserror_false(mcp_tenant, monkeypatch):
+    """Verify JSON-RPC tool dispatch returns isError: false when dataset is empty (HTTP 204)."""
+    handler = ZohoRecruitMCPHandler(tenant_id=mcp_tenant.id)
+    monkeypatch.setattr(handler, "_fetch_records", lambda mod, page, per_page: {
+        "data": [],
+        "info": {"page": page, "per_page": per_page, "more_records": False},
+    })
+    dispatcher = MCPServerDispatcher(handler=handler)
+
+    req = {
+        "jsonrpc": "2.0",
+        "id": 101,
+        "method": "tools/call",
+        "params": {
+            "name": "list_applications",
+            "arguments": {"page": 1, "per_page": 10},
+        },
+    }
+    resp = dispatcher.dispatch(req)
+    assert resp is not None
+    assert resp["id"] == 101
+    assert resp["result"]["isError"] is False
+    content_text = resp["result"]["content"][0]["text"]
+    parsed = json.loads(content_text)
+    assert parsed["count"] == 0
+    assert parsed["applications"] == []
+    assert parsed["has_more"] is False
+    assert "error" not in parsed
+
+
+def test_zoho_client_get_module_records_204_and_status_codes():
+    """Verify ZohoRecruitClient.get_module_records handles 204, 200, 401, 403, and 429."""
+    import httpx
+    from app.core.exceptions import IntegrationError, OAuthError, RateLimitError
+    from app.integrations.zoho.client import ZohoRecruitClient
+
+    # 1. Test HTTP 204 No Content -> returns empty data structure
+    client_204 = ZohoRecruitClient(
+        "client_id", "secret", "https://cb.test", "in",
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(204, content=b"")))
+    )
+    res_204 = client_204.get_module_records("Applications", "mock_token", page=1, per_page=20)
+    assert res_204 == {"data": [], "info": {"page": 1, "per_page": 20, "more_records": False}}
+
+    # 2. Test HTTP 200 OK -> returns parsed JSON
+    client_200 = ZohoRecruitClient(
+        "client_id", "secret", "https://cb.test", "in",
+        http_client=httpx.Client(transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={"data": [{"id": "app_1"}], "info": {"more_records": False}})
+        ))
+    )
+    res_200 = client_200.get_module_records("Applications", "mock_token")
+    assert res_200["data"][0]["id"] == "app_1"
+
+    # 3. Test HTTP 401 Unauthorized -> raises OAuthError
+    client_401 = ZohoRecruitClient(
+        "client_id", "secret", "https://cb.test", "in",
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(401)))
+    )
+    with pytest.raises(OAuthError):
+        client_401.get_module_records("Applications", "mock_token")
+
+    # 4. Test HTTP 403 Forbidden -> raises IntegrationError
+    client_403 = ZohoRecruitClient(
+        "client_id", "secret", "https://cb.test", "in",
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(403)))
+    )
+    with pytest.raises(IntegrationError) as exc_403:
+        client_403.get_module_records("Applications", "mock_token")
+    assert "HTTP 403" in str(exc_403.value)
+
+    # 5. Test HTTP 429 Rate Limit -> raises RateLimitError
+    client_429 = ZohoRecruitClient(
+        "client_id", "secret", "https://cb.test", "in",
+        http_client=httpx.Client(transport=httpx.MockTransport(
+            lambda req: httpx.Response(429, headers={"Retry-After": "30"})
+        ))
+    )
+    with pytest.raises(RateLimitError):
+        client_429.get_module_records("Applications", "mock_token")
+
+
 # ─── 5. Strict Module Allowlist Enforcement ───────────────────────────────────
 
 

@@ -178,6 +178,10 @@ class ZohoRecruitClient:
         if resp.status_code == 401:
             raise OAuthError("Zoho access token is invalid or expired.")
 
+        # Zoho returns HTTP 204 No Content when a module contains 0 records
+        if resp.status_code == 204:
+            return {"data": [], "info": {"page": page, "per_page": min(per_page, 200), "more_records": False}}
+
         if resp.status_code >= 400:
             logger.error("zoho.fetch_module_failed", module=module, status_code=resp.status_code)
             raise IntegrationError("zoho_recruit", f"Failed to fetch {module}: HTTP {resp.status_code}")
