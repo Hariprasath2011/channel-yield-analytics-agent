@@ -665,3 +665,98 @@ class AnalyticsSnapshot(Base):
         DateTime(timezone=True), nullable=False, default=_now
     )
 
+
+# ─── Session-Based Analytics ──────────────────────────────────────────────────
+
+
+class AnalyticsSessionLock(Base):
+    """Global coordination lock for session-based analytics.
+
+    Enforces exactly one active analytics session across the entire deployment.
+    """
+    __tablename__ = "analytics_session_locks"
+
+    lock_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    locked_by_session_id: Mapped[Optional[str]] = mapped_column(String(36))
+    acquired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class AnalyticsSession(Base):
+    """Lifecycle and audit record for a temporary analytics session."""
+    __tablename__ = "analytics_sessions"
+    __table_args__ = (
+        Index("ix_analytics_sessions_status", "status"),
+        Index("ix_analytics_sessions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    session_token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="SESSION_INITIALIZING",
+    )
+    data_center: Mapped[str] = mapped_column(String(8), nullable=False, default="com")
+    zoho_org_id: Mapped[Optional[str]] = mapped_column(String(64))
+    oauth_state_hash: Mapped[Optional[str]] = mapped_column(String(64), unique=True)
+    encrypted_auth_url: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    processing_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    termination_reason: Mapped[Optional[str]] = mapped_column(String(64))
+
+    credentials: Mapped[Optional["AnalyticsSessionCredential"]] = relationship(
+        "AnalyticsSessionCredential", back_populates="session", uselist=False, cascade="all, delete-orphan"
+    )
+
+
+class AnalyticsSessionCredential(Base):
+    """Temporary encrypted OAuth tokens bound to an active analytics session.
+
+    Separated strictly from permanent ZohoIntegration records.
+    Permanently purged on session termination, expiry, or authorization failure.
+    """
+    __tablename__ = "analytics_session_credentials"
+
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("analytics_sessions.id", ondelete="CASCADE"), primary_key=True
+    )
+    encrypted_access_token: Mapped[str] = mapped_column(Text, nullable=False)
+    encrypted_refresh_token: Mapped[Optional[str]] = mapped_column(Text)
+    token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now, onupdate=_now
+    )
+
+    session: Mapped["AnalyticsSession"] = relationship(
+        "AnalyticsSession", back_populates="credentials"
+    )
+
+
+class AnalyticsSessionAuditLog(Base):
+    """Privacy-safe audit log for analytics session lifecycle events.
+
+    Strictly avoids storing candidate PII, recruitment records,
+    tokens, or raw OAuth secrets. Only sanitized operational metadata is recorded.
+    """
+    __tablename__ = "analytics_session_audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now
+    )
+    details_json: Mapped[Optional[str]] = mapped_column(Text)
+
+

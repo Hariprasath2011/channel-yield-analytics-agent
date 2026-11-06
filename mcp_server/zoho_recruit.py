@@ -36,6 +36,7 @@ from app.integrations.zoho.selection_history import SelectionHistoryService
 from app.integrations.zoho.service import ZohoService
 from app.persistence.database import get_db_context
 from app.persistence.models import OAuthState, SyncJob, Tenant, ZohoIntegration
+from app.sessions.manager import SessionManager
 
 logger = get_logger(__name__)
 
@@ -68,7 +69,12 @@ MAX_PER_PAGE = 100
 
 
 def get_primary_active_integration() -> Optional[ZohoIntegration]:
-    """Retrieve the single active Zoho integration for the primary tenant (single-user flow)."""
+    """Retrieve the single active Zoho integration (strictly disabled in production)."""
+    env = os.getenv("CY_ENV", "").strip().lower()
+    if env in ("production", "prod"):
+        logger.warning("mcp.primary_integration_fallback_blocked_in_production")
+        return None
+
     try:
         with get_db_context() as db:
             integration = (
@@ -143,56 +149,57 @@ class ZohoRecruitMCPHandler:
     def _get_authenticated_client(
         self, db: Session
     ) -> tuple[ZohoRecruitClient, str]:
-        """Resolve tenant integration, check token expiry, refresh if needed, and return client."""
-        if not self._tenant_id:
-            raise ValidationError(
-                "There is no configured tenant ID bound to this MCP request. Please authenticate with a valid customer connection token."
-            )
+        """Resolve tenant integration or active analytics session, refresh if needed, and return client."""
+        # 1. Explicit capability tenant ID is bound to handler
+        if self._tenant_id:
+            integration = ZohoService.get_integration(db, self._tenant_id)
+            if not integration or integration.status != "active":
+                raise NotFoundError(
+                    f"No active Zoho Recruit integration found for tenant '{self._tenant_id}'."
+                )
 
-        integration = ZohoService.get_integration(db, self._tenant_id)
-        if not integration or integration.status != "active":
-            raise NotFoundError(
-                f"No active Zoho Recruit integration found for tenant '{self._tenant_id}'."
-            )
+            settings = get_settings()
+            now_utc = datetime.now(timezone.utc)
+            token_exp = integration.token_expires_at
+            if token_exp and token_exp.tzinfo is None:
+                token_exp = token_exp.replace(tzinfo=timezone.utc)
 
-        settings = get_settings()
-        now_utc = datetime.now(timezone.utc)
-        token_exp = integration.token_expires_at
-        if token_exp and token_exp.tzinfo is None:
-            token_exp = token_exp.replace(tzinfo=timezone.utc)
+            access_token = decrypt_token(integration.encrypted_access_token)
 
-        access_token = decrypt_token(integration.encrypted_access_token)
+            # Refresh token if missing or expiring within 60 seconds
+            if not access_token or (token_exp and token_exp <= now_utc + timedelta(seconds=60)):
+                refresh_token = decrypt_token(integration.encrypted_refresh_token)
+                if not refresh_token:
+                    integration.status = "token_expired"
+                    db.commit()
+                    raise OAuthError("Zoho refresh token is missing; re-authorization is required.")
 
-        # Refresh token if missing or expiring within 60 seconds
-        if not access_token or (token_exp and token_exp <= now_utc + timedelta(seconds=60)):
-            refresh_token = decrypt_token(integration.encrypted_refresh_token)
-            if not refresh_token:
-                integration.status = "token_expired"
+                client = ZohoRecruitClient(
+                    client_id=settings.zoho_client_id,
+                    client_secret=settings.zoho_client_secret,
+                    redirect_uri=settings.zoho_redirect_uri,
+                    data_center=integration.data_center or "com",
+                )
+                logger.info("mcp.zoho_refreshing_access_token", tenant_id=self._tenant_id)
+                refreshed = client.refresh_access_token(refresh_token)
+                access_token = refreshed["access_token"]
+                expires_in = int(refreshed.get("expires_in", 3600))
+
+                integration.encrypted_access_token = encrypt_token(access_token)
+                integration.token_expires_at = now_utc + timedelta(seconds=expires_in)
                 db.commit()
-                raise OAuthError("Zoho refresh token is missing; re-authorization is required.")
+            else:
+                client = ZohoRecruitClient(
+                    client_id=settings.zoho_client_id,
+                    client_secret=settings.zoho_client_secret,
+                    redirect_uri=settings.zoho_redirect_uri,
+                    data_center=integration.data_center or "com",
+                )
 
-            client = ZohoRecruitClient(
-                client_id=settings.zoho_client_id,
-                client_secret=settings.zoho_client_secret,
-                redirect_uri=settings.zoho_redirect_uri,
-                data_center=integration.data_center or "com",
-            )
-            logger.info("mcp.zoho_refreshing_access_token", tenant_id=self._tenant_id)
-            refreshed = client.refresh_access_token(refresh_token)
-            access_token = refreshed["access_token"]
-            expires_in = int(refreshed.get("expires_in", 3600))
+            return client, access_token
 
-            integration.encrypted_access_token = encrypt_token(access_token)
-            integration.token_expires_at = now_utc + timedelta(seconds=expires_in)
-            db.commit()
-        else:
-            client = ZohoRecruitClient(
-                client_id=settings.zoho_client_id,
-                client_secret=settings.zoho_client_secret,
-                redirect_uri=settings.zoho_redirect_uri,
-                data_center=integration.data_center or "com",
-            )
-
+        # 2. Session-based analytics flow (shared iGentic MCP endpoint)
+        session, client, access_token = SessionManager.verify_and_touch_session(db)
         return client, access_token
 
     def _fetch_records(
@@ -497,9 +504,44 @@ class ZohoRecruitMCPHandler:
             with get_db_context() as db:
                 target_tenant_id = self._tenant_id
                 if not target_tenant_id:
-                    stage = "primary_tenant_resolution"
-                    primary_tenant = get_or_create_primary_tenant(db)
-                    target_tenant_id = primary_tenant.id
+                    # Ephemeral session mode (shared iGentic MCP endpoint) - strictly read-only
+                    stage = "session_lookup"
+                    sess_status = SessionManager.get_status(db)
+                    status_name = sess_status.get("status")
+                    if status_name in ("ACTIVE", "PROCESSING"):
+                        return {
+                            "connected": True,
+                            "status": "active",
+                            "session_id": sess_status.get("session_id"),
+                            "data_center": sess_status.get("data_center"),
+                            "zoho_org_id": sess_status.get("zoho_org_id"),
+                            "expires_in_minutes": sess_status.get("remaining_minutes"),
+                            "mode": "session",
+                        }
+                    elif status_name == "AWAITING_ZOHO_AUTHORIZATION":
+                        auth_url = sess_status.get("authorization_url", "")
+                        return {
+                            "connected": False,
+                            "status": "awaiting_authorization",
+                            "session_id": sess_status.get("session_id"),
+                            "data_center": sess_status.get("data_center"),
+                            "authorization_url": auth_url,
+                            "message": (
+                                "A Zoho authorization is currently pending. Please complete authorization in your browser, "
+                                "or call 'get_zoho_authorization_url' to retrieve the link."
+                            ),
+                            "mode": "session",
+                        }
+                    else:
+                        return {
+                            "connected": False,
+                            "status": "disconnected",
+                            "message": (
+                                "No active Zoho Recruit session is connected. "
+                                "Call 'start_analytics_session' or 'connect_zoho_account' to begin authorization."
+                            ),
+                            "mode": "session",
+                        }
 
                 stage = "integration_lookup"
                 integration = ZohoService.get_integration(db, target_tenant_id)
@@ -511,6 +553,7 @@ class ZohoRecruitMCPHandler:
                         "data_center": integration.data_center,
                         "zoho_org_id": integration.zoho_org_id,
                         "last_sync_at": integration.last_sync_at.isoformat() if integration.last_sync_at else None,
+                        "mode": "permanent_tenant",
                     }
 
                 stage = "auth_url_generation"
@@ -539,12 +582,79 @@ class ZohoRecruitMCPHandler:
 
     def connect_zoho_account(self, data_center: Optional[str] = None) -> dict[str, Any]:
         """Generate a clickable Zoho Recruit OAuth authorization link to connect the account."""
-        res = self.check_zoho_connection(data_center=data_center)
+        dc, err = self.resolve_data_center(data_center)
+        if err:
+            return err
+        if not self._tenant_id:
+            res = self.start_analytics_session(data_center=dc)
+            if res.get("status") in ("awaiting_authorization", "active"):
+                res["status"] = "requires_authorization"
+            return res
+        res = self.check_zoho_connection(data_center=dc)
         if res.get("status") == "error":
             return res
         if not res.get("connected"):
             res["status"] = "requires_authorization"
         return res
+
+    # ─── Session-Based Analytics Tools (Ephemeral OAuth Lifecycle) ──────────
+
+    def start_analytics_session(self, data_center: Optional[str] = None) -> dict[str, Any]:
+        """Acquire a temporary exclusive analytics session and return a Zoho OAuth authorization link."""
+        dc, err = self.resolve_data_center(data_center)
+        if err:
+            return err
+        try:
+            with get_db_context() as db:
+                return SessionManager.acquire_session(db, data_center=dc)
+        except Exception as exc:
+            logger.error("mcp.start_analytics_session_error", error=type(exc).__name__, message=str(exc))
+            return {"status": "error", "error": "session_error", "message": f"Failed to acquire session: {str(exc)}"}
+
+    def get_zoho_authorization_url(self) -> dict[str, Any]:
+        """Retrieve the current pending Zoho authorization URL if a session is awaiting authorization."""
+        try:
+            with get_db_context() as db:
+                status = SessionManager.get_status(db)
+                if status.get("status") == "AWAITING_ZOHO_AUTHORIZATION":
+                    return {
+                        "status": "awaiting_authorization",
+                        "session_id": status.get("session_id"),
+                        "authorization_url": status.get("authorization_url"),
+                        "instructions": "Click the link to authorize Zoho Recruit in your browser. Once completed, your session will activate.",
+                    }
+                elif status.get("status") == "ACTIVE":
+                    return {
+                        "status": "active",
+                        "session_id": status.get("session_id"),
+                        "message": "Session is already authorized and active. You can run recruitment analytics directly.",
+                    }
+                else:
+                    return {
+                        "status": "no_session",
+                        "message": "No session awaiting authorization. Call start_analytics_session() first.",
+                    }
+        except Exception as exc:
+            logger.error("mcp.get_zoho_authorization_url_error", error=type(exc).__name__)
+            return {"status": "error", "error": "session_error", "message": str(exc)}
+
+    def get_analytics_session_status(self) -> dict[str, Any]:
+        """Check the status, remaining inactivity time, and connection state of the current analytics session."""
+        try:
+            with get_db_context() as db:
+                return SessionManager.get_status(db)
+        except Exception as exc:
+            logger.error("mcp.get_analytics_session_status_error", error=type(exc).__name__)
+            return {"status": "error", "error": "session_error", "message": str(exc)}
+
+    def end_analytics_session(self) -> dict[str, Any]:
+        """Terminate the active analytics session, revoke remote Zoho credentials, and delete local tokens."""
+        try:
+            with get_db_context() as db:
+                return SessionManager.terminate_session(db, reason="user_requested")
+        except Exception as exc:
+            logger.error("mcp.end_analytics_session_error", error=type(exc).__name__)
+            return {"status": "error", "error": "session_error", "message": str(exc)}
 
     # ─── Tool 5: compute_channel_yield (Live In-Memory Analytics) ─────────────
 
@@ -563,13 +673,7 @@ class ZohoRecruitMCPHandler:
             Raw job openings, candidate profiles, and applications are never saved to database tables,
             CSV files, temporary SQLite files, or persistent caches.
         """
-        if not self._tenant_id:
-            return {
-                "status": "error",
-                "error": "unconfigured_tenant",
-                "message": "Session has no configured tenant ID. Please connect your Zoho Recruit account first.",
-            }
-
+        effective_tenant = self._tenant_id or "session_tenant"
         try:
             # 1. Obtain authenticated Zoho client and access token
             with get_db_context() as db:
@@ -590,18 +694,18 @@ class ZohoRecruitMCPHandler:
 
             # 4. Map records in memory using canonical schema mappers (transient dictionaries)
             canonical_jobs = [
-                map_zoho_job_opening(rec, self._tenant_id, "live_mcp_run")
+                map_zoho_job_opening(rec, effective_tenant, "live_mcp_run")
                 for rec in raw_jobs
             ]
             canonical_apps = [
-                map_zoho_application(rec, candidate_source_map, self._tenant_id, "live_mcp_run")
+                map_zoho_application(rec, candidate_source_map, effective_tenant, "live_mcp_run")
                 for rec in raw_applications
             ]
 
             # 5. Execute in-memory yield analytics engine
             calculation_as_of = as_of_date or datetime.now(timezone.utc).date().isoformat()
             metrics = compute_live_channel_yield(
-                tenant_id=self._tenant_id,
+                tenant_id=effective_tenant,
                 requisitions=canonical_jobs,
                 applications=canonical_apps,
                 stage_events=[],  # Explicitly empty: no fabricated events
@@ -768,7 +872,19 @@ class ZohoRecruitMCPHandler:
     def get_sync_status(self) -> dict[str, Any]:
         """Retrieve administrative synchronization status and history for the organization."""
         if not self._tenant_id:
-            return {"status": "error", "error": "unauthorized", "message": "Tenant not resolved."}
+            try:
+                with get_db_context() as db:
+                    sess_status = SessionManager.get_status(db)
+                    return {
+                        "status": "success",
+                        "mode": "ephemeral_session",
+                        "session_status": sess_status.get("status"),
+                        "session_id": sess_status.get("session_id"),
+                        "remaining_minutes": sess_status.get("remaining_minutes"),
+                        "data_center": sess_status.get("data_center"),
+                    }
+            except Exception as exc:
+                return {"status": "error", "error": "session_error", "message": str(exc)}
         try:
             with get_db_context() as db:
                 integration = (

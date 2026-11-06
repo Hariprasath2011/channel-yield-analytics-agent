@@ -128,7 +128,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         port=settings.port,
         legacy_enabled=settings.legacy_enabled,
     )
+    # Start periodic background expiry sweeper (every 60s)
+    try:
+        from app.persistence.database import get_db_context
+        from app.sessions.manager import SessionManager
+        enable_sweeper = os.getenv("CY_MCP_ENABLE_BACKGROUND_SWEEPER", "true").lower() in ("true", "1", "yes")
+        if enable_sweeper and settings.env != "testing":
+            SessionManager.start_background_cleanup_task(get_db_context, interval_seconds=60)
+    except Exception as exc:
+        logger.warning("app.background_cleanup_startup_failed", error=str(exc))
+
     yield
+
+    try:
+        from app.sessions.manager import SessionManager
+        SessionManager.stop_background_cleanup_task()
+    except Exception:
+        pass
     logger.info("app.shutdown")
 
 

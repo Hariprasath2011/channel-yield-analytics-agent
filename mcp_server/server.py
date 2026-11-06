@@ -138,6 +138,56 @@ def verify_user_connection_token(
 
 # Tool specifications conform to Model Context Protocol JSON Schema
 MCP_TOOLS = [
+    # ── Ephemeral Analytics Session Lifecycle Tools ──────────────────────────
+    {
+        "name": "start_analytics_session",
+        "description": (
+            "Start a temporary exclusive analytics session and generate a Zoho Recruit OAuth authorization link. "
+            "Only one active session is permitted globally. Auto-expires after 30 minutes of inactivity."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "data_center": {
+                    "type": "string",
+                    "description": "Zoho data center where your account is hosted (e.g. 'com', 'eu', 'in', 'au', 'jp', 'ca'). 'com.au' is accepted as an alias for 'au'. Defaults to 'com'.",
+                    "enum": ["com", "eu", "in", "au", "jp", "ca"],
+                    "default": "com",
+                },
+            },
+        },
+    },
+    {
+        "name": "get_zoho_authorization_url",
+        "description": (
+            "Retrieve the pending Zoho OAuth authorization URL for the currently initializing analytics session."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_analytics_session_status",
+        "description": (
+            "Check current analytics session status, remaining inactivity time, and Zoho connection state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "end_analytics_session",
+        "description": (
+            "Explicitly terminate the current analytics session, revoke remote Zoho OAuth tokens, and unconditionally purge local credentials."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+
     # ── Connection & Metadata Tools ──────────────────────────────────────────
     {
         "name": "test_zoho_connection",
@@ -715,27 +765,16 @@ class MCPServerDispatcher:
                         }
                     }
                 target_handler = ZohoRecruitMCPHandler(tenant_id=verified["tid"])
-            elif not target_handler.tenant_id:
-                if tool_name not in ("check_zoho_connection", "test_zoho_connection", "connect_zoho_account"):
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": json.dumps({
-                                        "status": "error",
-                                        "error": "unauthorized",
-                                        "message": "No tenant is bound to this request or session. Please authenticate with a valid customer connection token."
-                                    }, indent=2)
-                                }
-                            ],
-                            "isError": True,
-                        }
-                    }
 
-            if tool_name in ("check_zoho_connection", "test_zoho_connection"):
+            if tool_name == "start_analytics_session":
+                result_data = target_handler.start_analytics_session(data_center=tool_args.get("data_center"))
+            elif tool_name == "get_zoho_authorization_url":
+                result_data = target_handler.get_zoho_authorization_url()
+            elif tool_name == "get_analytics_session_status":
+                result_data = target_handler.get_analytics_session_status()
+            elif tool_name == "end_analytics_session":
+                result_data = target_handler.end_analytics_session()
+            elif tool_name in ("check_zoho_connection", "test_zoho_connection"):
                 result_data = target_handler.test_zoho_connection(data_center=tool_args.get("data_center"))
             elif tool_name == "connect_zoho_account":
                 result_data = target_handler.connect_zoho_account(data_center=tool_args.get("data_center"))
@@ -1104,14 +1143,28 @@ async def _dispatch_incoming_message(request: Request) -> JSONResponse:
         if not session_tenant_id:
             session_tenant_id = token_tenant_id
 
-    # For tool executions, require an authenticated tenant bound to session, token, or argument
+    # For tool executions, require an authenticated operational session, bound tenant, or valid token argument
     if is_tool_call:
         tool_name = body.get("params", {}).get("name") if isinstance(body, dict) else None
         tool_args = body.get("params", {}).get("arguments", {}) if isinstance(body, dict) else {}
         has_arg_token = bool(tool_args.get("connection_token"))
-        is_onboarding_tool = tool_name in ("check_zoho_connection", "connect_zoho_account")
+        is_onboarding_tool = tool_name in (
+            "check_zoho_connection", "connect_zoho_account", "test_zoho_connection",
+            "start_analytics_session", "get_zoho_authorization_url", "get_analytics_session_status", "end_analytics_session"
+        )
         if not session_tenant_id and not has_arg_token:
-            if not (is_operational_session and is_onboarding_tool):
+            has_active_analytics_session = False
+            if is_operational_session:
+                try:
+                    from app.persistence.database import get_db_context
+                    from app.sessions.manager import SessionManager
+                    with get_db_context() as db:
+                        status = SessionManager.get_status(db)
+                        if status.get("status") in ("ACTIVE", "PROCESSING"):
+                            has_active_analytics_session = True
+                except Exception:
+                    pass
+            if not (is_operational_session and (is_onboarding_tool or has_active_analytics_session)):
                 msg = (
                     "Zoho Recruit is not connected yet. Please call 'connect_zoho_account' or 'check_zoho_connection' to obtain the authorization link."
                     if is_operational_session
@@ -1191,7 +1244,25 @@ def create_mcp_app(dispatcher: Optional[MCPServerDispatcher] = None) -> Starlett
         Route("/mcp", messages_endpoint, methods=["POST"]),
         Route("/mcp/{secret_key}", messages_capability_endpoint, methods=["POST"]),
     ]
-    app = Starlette(routes=routes)
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mcp_lifespan(app: Starlette):
+        try:
+            from app.persistence.database import get_db_context
+            from app.sessions.manager import SessionManager
+            SessionManager.start_background_cleanup_task(get_db_context, interval_seconds=60)
+        except Exception as exc:
+            logger.warning("mcp.background_cleanup_startup_failed", error=str(exc))
+        yield
+        try:
+            from app.sessions.manager import SessionManager
+            SessionManager.stop_background_cleanup_task()
+        except Exception:
+            pass
+
+    app = Starlette(routes=routes, lifespan=mcp_lifespan)
     app.state.dispatcher = dispatcher or MCPServerDispatcher()
     return app
 
