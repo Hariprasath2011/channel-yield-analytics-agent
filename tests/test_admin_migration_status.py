@@ -108,27 +108,7 @@ def test_migration_status_analyst_role_forbidden(client: TestClient, auth_setup)
 
 def test_migration_status_admin_authorized_pending_migration(client: TestClient, auth_setup, db_session: Session):
     """Admin receives HTTP 200 with migration_pending=True when revision matches predecessor."""
-    # Seed alembic_version with predecessor revision '81e098bcb28a'
-    db_session.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
-    db_session.execute(text("DELETE FROM alembic_version"))
-    db_session.execute(text("INSERT INTO alembic_version (version_num) VALUES ('81e098bcb28a')"))
-    db_session.commit()
-
-    resp = client.get(
-        "/v2/admin/database/migration-status",
-        headers={"Authorization": f"Bearer {auth_setup['admin_token']}"},
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["database_connected"] is True
-    assert data["current_revision"] == "81e098bcb28a"
-    assert data["expected_head_revision"] == "92f1a8c3d4e5"
-    assert data["migration_pending"] is True
-
-
-def test_migration_status_admin_authorized_upgraded_migration(client: TestClient, auth_setup, db_session: Session):
-    """Admin receives HTTP 200 with migration_pending=False when revision matches expected head."""
-    # Seed alembic_version with expected head revision '92f1a8c3d4e5'
+    # Seed alembic_version with predecessor revision '92f1a8c3d4e5'
     db_session.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
     db_session.execute(text("DELETE FROM alembic_version"))
     db_session.execute(text("INSERT INTO alembic_version (version_num) VALUES ('92f1a8c3d4e5')"))
@@ -142,7 +122,27 @@ def test_migration_status_admin_authorized_upgraded_migration(client: TestClient
     data = resp.json()
     assert data["database_connected"] is True
     assert data["current_revision"] == "92f1a8c3d4e5"
-    assert data["expected_head_revision"] == "92f1a8c3d4e5"
+    assert data["expected_head_revision"] == "a3c4e5f6a7b8"
+    assert data["migration_pending"] is True
+
+
+def test_migration_status_admin_authorized_upgraded_migration(client: TestClient, auth_setup, db_session: Session):
+    """Admin receives HTTP 200 with migration_pending=False when revision matches expected head."""
+    # Seed alembic_version with expected head revision 'a3c4e5f6a7b8'
+    db_session.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
+    db_session.execute(text("DELETE FROM alembic_version"))
+    db_session.execute(text("INSERT INTO alembic_version (version_num) VALUES ('a3c4e5f6a7b8')"))
+    db_session.commit()
+
+    resp = client.get(
+        "/v2/admin/database/migration-status",
+        headers={"Authorization": f"Bearer {auth_setup['admin_token']}"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["database_connected"] is True
+    assert data["current_revision"] == "a3c4e5f6a7b8"
+    assert data["expected_head_revision"] == "a3c4e5f6a7b8"
     assert data["migration_pending"] is False
 
 
@@ -150,7 +150,7 @@ def test_migration_status_owner_authorized(client: TestClient, auth_setup, db_se
     """Owner receives HTTP 200 with migration status."""
     db_session.execute(text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
     db_session.execute(text("DELETE FROM alembic_version"))
-    db_session.execute(text("INSERT INTO alembic_version (version_num) VALUES ('92f1a8c3d4e5')"))
+    db_session.execute(text("INSERT INTO alembic_version (version_num) VALUES ('a3c4e5f6a7b8')"))
     db_session.commit()
 
     resp = client.get(
@@ -160,7 +160,7 @@ def test_migration_status_owner_authorized(client: TestClient, auth_setup, db_se
     assert resp.status_code == 200
     data = resp.json()
     assert data["database_connected"] is True
-    assert data["current_revision"] == "92f1a8c3d4e5"
+    assert data["current_revision"] == "a3c4e5f6a7b8"
 
 
 def test_migration_status_table_missing(client: TestClient, auth_setup, db_session: Session):

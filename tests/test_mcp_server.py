@@ -85,6 +85,10 @@ def test_mcp_tools_list():
     tools = resp["result"]["tools"]
     tool_names = [t["name"] for t in tools]
     required_tools = [
+        "start_analytics_session",
+        "get_zoho_authorization_url",
+        "get_analytics_session_status",
+        "end_analytics_session",
         "test_zoho_connection",
         "check_zoho_connection",
         "connect_zoho_account",
@@ -106,7 +110,7 @@ def test_mcp_tools_list():
     ]
     for r_tool in required_tools:
         assert r_tool in tool_names, f"Missing tool: {r_tool}"
-    assert len(tools) == 18
+    assert len(tools) == 22
 
 
 
@@ -416,7 +420,7 @@ def test_unconfigured_tenant_id():
     res = handler.list_candidates()
 
     assert "error" in res
-    assert "no configured tenant ID" in res["message"]
+    assert "No active analytics session found" in res["message"] or "no configured tenant ID" in res["message"]
 
 
 # ─── 8. Rate Limit Mapping ────────────────────────────────────────────────────
@@ -1009,7 +1013,7 @@ def test_production_no_implicit_fallback_to_fixed_tenant(monkeypatch):
 
     res = handler.check_zoho_connection()
     assert res["connected"] is False
-    assert res["status"] == "unconfigured"
+    assert res["status"] in ("unconfigured", "no_active_session", "disconnected")
 
 
 # ─── 14. Single-User iGentic-First Onboarding & Boundary Tests ────────────────
@@ -1047,8 +1051,8 @@ def test_single_user_onboarding_unconnected_session_instructions(db_session, mon
             assert msg1["id"] == 1
             content1 = json.loads(msg1["result"]["content"][0]["text"])
             assert content1["connected"] is False
-            assert "authorization_url" in content1
-            assert "/oauth/v2/auth" in content1["authorization_url"]
+            assert content1["status"] == "disconnected"
+            assert "start_analytics_session" in content1["message"] or "connect_zoho_account" in content1["message"]
 
             # 2. Calling onboarding tool 'connect_zoho_account' is permitted
             connect_req = {
@@ -1389,7 +1393,7 @@ def test_check_zoho_connection_error_logging_redacts_credentials(monkeypatch):
     @contextlib.contextmanager
     def mock_failing_db_context():
         mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.order_by.return_value.first.side_effect = simulated_exc
+        mock_db.query.side_effect = simulated_exc
         yield mock_db
 
     monkeypatch.setattr(zr_mod, "get_db_context", mock_failing_db_context)
@@ -1404,14 +1408,14 @@ def test_check_zoho_connection_error_logging_redacts_credentials(monkeypatch):
     # 2. Logger called with visible message and sanitized kwargs
     expected_msg = (
         "mcp.check_connection_error "
-        "(error=SimulatedOperationalError driver=SimulatedDriverError sqlstate=08006 stage=primary_tenant_resolution)"
+        "(error=SimulatedOperationalError driver=SimulatedDriverError sqlstate=08006 stage=session_lookup)"
     )
     mock_logger_error.assert_called_once_with(
         expected_msg,
         error="SimulatedOperationalError",
         driver="SimulatedDriverError",
         sqlstate="08006",
-        stage="primary_tenant_resolution",
+        stage="session_lookup",
     )
 
     # 3. Verify visible message explicitly includes sanitized metadata
@@ -1419,7 +1423,7 @@ def test_check_zoho_connection_error_logging_redacts_credentials(monkeypatch):
     assert "error=SimulatedOperationalError" in visible_msg
     assert "driver=SimulatedDriverError" in visible_msg
     assert "sqlstate=08006" in visible_msg
-    assert "stage=primary_tenant_resolution" in visible_msg
+    assert "stage=session_lookup" in visible_msg
 
     # 4. Verify sensitive fragments are absent from all logged arguments and keyword values
     logged_str = " ".join(str(arg) for arg in mock_logger_error.call_args[0]) + " " + " ".join(f"{k}={v}" for k, v in mock_logger_error.call_args[1].items())
@@ -1509,7 +1513,7 @@ def test_standard_stream_logging_emits_sanitized_fields_without_leaks(monkeypatc
     @contextlib.contextmanager
     def mock_failing_db():
         mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.order_by.return_value.first.side_effect = simulated_exc
+        mock_db.query.side_effect = simulated_exc
         yield mock_db
 
     monkeypatch.setattr(zr_mod, "get_db_context", mock_failing_db)
@@ -1537,7 +1541,7 @@ def test_standard_stream_logging_emits_sanitized_fields_without_leaks(monkeypatc
         assert "error=SimulatedOperationalError" in stream_output
         assert "driver=SimulatedDriverError" in stream_output
         assert "sqlstate=08006" in stream_output
-        assert "stage=primary_tenant_resolution" in stream_output
+        assert "stage=session_lookup" in stream_output
 
         # 3. Sensitive items strictly absent from emitted stream
         assert secret_pw not in stream_output

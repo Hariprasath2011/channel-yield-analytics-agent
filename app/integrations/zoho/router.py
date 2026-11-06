@@ -1,6 +1,4 @@
-"""Zoho Recruit integration router (/v2/integrations/zoho)."""
-from __future__ import annotations
-
+import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -17,6 +15,8 @@ from app.core.logging import get_logger
 from app.integrations.zoho.client import DATACENTER_DOMAINS, ZohoRecruitClient
 from app.integrations.zoho.service import ZohoService
 from app.persistence.database import get_db
+from app.persistence.models import AnalyticsSession
+from app.sessions.manager import SessionManager
 from mcp_server.server import create_user_connection_token
 
 logger = get_logger(__name__)
@@ -381,6 +381,31 @@ def handle_browser_callback(
 
     # 4. Exchange code for tokens and persist credentials
     try:
+        # Check if state belongs to a temporary analytics session
+        state_hash = hashlib.sha256(state.encode("utf-8")).hexdigest()
+        session_obj = (
+            db.query(AnalyticsSession)
+            .filter(AnalyticsSession.oauth_state_hash == state_hash)
+            .first()
+        )
+        if session_obj:
+            client = _get_zoho_client(data_center=session_obj.data_center)
+            SessionManager.bind_oauth_credentials(
+                db,
+                raw_state=state,
+                code=code,
+                client=client,
+            )
+            logger.info("session.oauth_connected", data_center=session_obj.data_center)
+            return _render_callback_html(
+                title="Authorization Successful",
+                heading="Zoho Recruit Connected",
+                message="Your Zoho Recruit account has been successfully connected to your Channel Yield Analytics session. You may now close this window, return to iGentic, and run your recruitment analysis.",
+                is_success=True,
+                status_code=status.HTTP_200_OK,
+            )
+
+        # Fall back to permanent tenant integration OAuth flow
         client = _get_zoho_client()
         integration = ZohoService.exchange_and_save_tokens(
             db,

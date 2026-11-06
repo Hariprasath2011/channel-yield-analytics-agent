@@ -28,6 +28,16 @@ def _is_valid_url(url: str | None) -> bool:
     return True
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize postgres:// or postgresql:// to postgresql+psycopg2:// for SQLAlchemy 2.0."""
+    url_clean = url.strip()
+    if url_clean.startswith("postgres://"):
+        return "postgresql+psycopg2://" + url_clean[len("postgres://"):]
+    if url_clean.startswith("postgresql://") and not url_clean.startswith("postgresql+"):
+        return "postgresql+psycopg2://" + url_clean[len("postgresql://"):]
+    return url_clean
+
+
 def get_url() -> str:
     """Resolve database URL in priority order:
     1. Explicitly configured, valid 'sqlalchemy.url' from Alembic Config.
@@ -39,27 +49,27 @@ def get_url() -> str:
     # 1. Explicitly configured, valid sqlalchemy.url from Alembic Config
     cfg_url = config.get_main_option("sqlalchemy.url")
     if _is_valid_url(cfg_url):
-        return cfg_url
+        return _normalize_url(cfg_url)
 
     # 2. Alembic CLI -x arguments
     try:
         x_args = context.get_x_argument(as_dictionary=True)
         x_url = x_args.get("url") or x_args.get("db_url")
         if _is_valid_url(x_url):
-            return x_url
+            return _normalize_url(x_url)
     except Exception:
         pass
 
     # 3. CY_DATABASE_URL environment variable
     env_url = os.environ.get("CY_DATABASE_URL")
     if _is_valid_url(env_url):
-        return env_url
+        return _normalize_url(env_url)
 
     # 4. Application settings
     try:
         settings_url = get_settings().database_url
         if _is_valid_url(settings_url):
-            return settings_url
+            return _normalize_url(settings_url)
     except Exception:
         pass
 
